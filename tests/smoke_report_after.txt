@@ -1,0 +1,6 @@
+# frame program: 3 passes
+# declared_B is a logical estimate from resource declarations, not GPU traffic
+# pass                            gpu_ms  declared_B    N N_eff steps/pixel workgroup tile
+cs_write                           0.071         512    1     1       1.000 64,1,1    0
+gfx_triangle                       0.201      131072    0     0       0.000 0,0,0    0
+cs_read                            0.093         256    0     0       0.000 64,1,1    0

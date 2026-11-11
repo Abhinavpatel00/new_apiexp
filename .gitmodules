@@ -1,0 +1,6 @@
+[submodule "external/mu_lib"]
+	path = external/mu_lib
+	url = https://github.com/abhinavpatel00/mu_lib-
+[submodule "external/glfw"]
+	path = external/glfw
+	url = https://github.com/glfw/glfw/

@@ -1,0 +1,14 @@
+# frame: cpu 0.016 ms, gpu 196.898 ms, passes 3, scopes 5
+# draws 5, dispatches 0, pushes 5, barriers 2
+# uploads 0 B, transient peak 0 B
+# declared logical resource bytes (estimate): 33177600 B; not physical GPU traffic
+# pass                            gpu_ms  declared_B    N N_eff steps/pixel workgroup tile
+GalaxySky                        100.044     7372800    0     0       0.000 0,0,0    0
+GalaxyStars                       84.321    14745600    0     0       0.000 0,0,0    0
+ToneMap                           12.533    11059200    0     0       0.000 0,0,0    0
+# scope                            pass                            gpu_ms stage paired resolved
+procedural sky                   GalaxySky                         39.180 0x02 yes yes
+stars                            GalaxyStars                       83.899 0x03 yes yes
+dust                             GalaxyStars                        0.295 0x03 yes yes
+core glow                        GalaxyStars                        0.085 0x03 yes yes
+HDR tone map                     ToneMap                            0.096 0x02 yes yes

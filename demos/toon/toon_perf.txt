@@ -1,0 +1,14 @@
+# frame: cpu 0.328 ms, gpu 40.942 ms, passes 4, scopes 4
+# draws 17, dispatches 0, pushes 17, barriers 4
+# uploads 0 B, transient peak 0 B
+# declared logical resource bytes (estimate): 56498112 B; not physical GPU traffic
+# pass                            gpu_ms  declared_B    N N_eff steps/pixel workgroup tile
+Backdrop                          12.093     7372800    0     0       0.000 0,0,0    0
+ToonForward                       13.789    19033056    0     0       0.000 0,0,0    0
+Outline                            5.256    19033056    0     0       0.000 0,0,0    0
+Resolve                            9.804    11059200    0     0       0.000 0,0,0    0
+# scope                            pass                            gpu_ms stage paired resolved
+backdrop                         Backdrop                           7.960 0x02 yes yes
+toon forward                     ToonForward                        0.098 0x03 yes yes
+outline hull                     Outline                            0.077 0x03 yes yes
+resolve                          Resolve                            0.098 0x02 yes yes

@@ -1,0 +1,10 @@
+# frame: cpu 0.002 ms, gpu 0.366 ms, passes 3, scopes 1
+# draws 1, dispatches 2, pushes 1, barriers 3
+# uploads 0 B, transient peak 1024 B
+# declared logical resource bytes (estimate): 131840 B; not physical GPU traffic
+# pass                            gpu_ms  declared_B    N N_eff steps/pixel workgroup tile
+cs_write                           0.071         512    1     1       1.000 64,1,1    0
+gfx_triangle                       0.201      131072    0     0       0.000 0,0,0    0
+cs_read                            0.093         256    0     0       0.000 64,1,1    0
+# scope                            pass                            gpu_ms stage paired resolved
+fullscreen draw                  gfx_triangle                       0.113 0x03 yes yes
