@@ -4,3 +4,12 @@
 *.so
 *.dll
 *.dylib
+
+# Compiled shader binaries (generated from .slang sources by slangc)
+*.spv
+
+# Image assets
+*.png
+
+# Binary data blobs
+*.bin
