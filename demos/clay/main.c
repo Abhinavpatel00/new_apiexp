@@ -144,16 +144,6 @@ static void app_frame(App *a) {
     demo_frame_end(d);
 }
 
-static PassDesc *compute_pass(PassDesc *p, const char *name, Pipe pipe, BufUse *reads, uint32_t read_count,
-                              BufUse *writes, uint32_t write_count) {
-    memset(p, 0, sizeof *p);
-    strcpy(p->name, name);
-    p->kind = PASS_COMPUTE;
-    p->pipe = pipe;
-    p->buf_reads = reads; p->buf_read_count = read_count;
-    p->buf_writes = writes; p->buf_write_count = write_count;
-    return p;
-}
 
 static FrameProgram *build(App *a, bool simulate) {
     Demo          *d = &a->demo;

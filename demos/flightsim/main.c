@@ -180,6 +180,10 @@ typedef struct App {
     float     orbit_yaw, orbit_pitch, orbit_dist;
     float     chase_eye[3];    /* damped: see the comment where it is written  */
 
+    /* ---- flight controls -------------------------------------------------- */
+    float     stick[3];        /* slew-limited stick position, -1 .. 1        */
+    float     look_yaw, look_pitch;  /* mouse look offset, cockpit view only       */
+
     /* ---- pushes ----------------------------------------------------------- */
     TerrainPush  terrain_push;
     WaterPush    water_push;
@@ -251,32 +255,61 @@ static void app_update(App *a)
     const Aircraft *p = &a->sim.player;
     const float     aspect = (float)d->width / (float)d->height;
     const float     tan_y  = tanf(mu_radians(a->fov_deg) * 0.5f);
-    float           target[3], up_hint[3], sun[3], sun_color[3], proj[16], R[16], ctl[3];
+    float           target[3], up_hint[3], sun[3], sun_color[3], proj[16], R[16];
     uint32_t        rebakes_before = a->weather.rebakes;
     uint32_t        warn = 0u;
 
     /* ---- controls ---------------------------------------------------------
-     * Written as one normalised triplet rather than as four separate flags, so
-     * the physics never learns which key produced a deflection and the same
-     * values drive both models. The sticks centre themselves: a real aircraft
-     * does, and one that does not makes the player hold a key for the whole
-     * flight. */
-    ctl[0] = ctl[1] = ctl[2] = 0.0f;
+     * Game-style flight controls:
+     *   W/S      pitch up / down   (pull back / push forward on the stick)
+     *   A/D      roll left / right (bank left / right)
+     *   Q/E      yaw left / right
+     *   Z/C      throttle down / up
+     *   RMB drag look around the cockpit
+     *
+     * The stick is slew-rate limited so it has weight and cannot snap from
+     * full left to full right in one frame. That is what makes flight controls
+     * feel physical instead of like a mouse cursor. The same slewed value
+     * drives both flight models.
+     */
     if (!d->headless && !d->ui_hovered) {
         const Platform     *pl = d->platform;
         const MuInputState *in = platform_state(pl);
-        ctl[0] += (platform_key_down(pl, MU_KEY_DOWN) || platform_key_down(pl, MU_KEY_S) ? -1.0f : 0.0f)
-                + (platform_key_down(pl, MU_KEY_UP)   || platform_key_down(pl, MU_KEY_W) ?  1.0f : 0.0f);
-        ctl[1] += (platform_key_down(pl, MU_KEY_RIGHT) || platform_key_down(pl, MU_KEY_D) ?  1.0f : 0.0f)
-                + (platform_key_down(pl, MU_KEY_LEFT)  || platform_key_down(pl, MU_KEY_A) ? -1.0f : 0.0f);
-        ctl[2] += (platform_key_down(pl, MU_KEY_E) ? 1.0f : 0.0f)
-                + (platform_key_down(pl, MU_KEY_Q) ? -1.0f : 0.0f);
 
-        /* The throttle is a position, not a rate: holding the key moves the
-         * lever and releasing it leaves it there, which is what a lever does. */
-        const float thr = (platform_key_down(pl, MU_KEY_LEFT_SHIFT) ? 0.45f : 0.0f)
-                        - (platform_key_down(pl, MU_KEY_LEFT_CTRL)  ? 0.45f : 0.0f);
+        /* Raw target deflections from the keyboard, -1 .. 1.
+         * Note the pitch axis is flipped from the raw aerospace convention so
+         * W means "pull up / nose up", which is what every flight game expects. */
+        float stick_tgt[3] = {0.0f, 0.0f, 0.0f};
+        stick_tgt[0] += (platform_key_down(pl, MU_KEY_W) ?  1.0f : 0.0f)   /* W = pitch up   */
+                    + (platform_key_down(pl, MU_KEY_S) ? -1.0f : 0.0f);   /* S = pitch down */
+        stick_tgt[1] += (platform_key_down(pl, MU_KEY_D) ?  1.0f : 0.0f)   /* D = roll right */
+                    + (platform_key_down(pl, MU_KEY_A) ? -1.0f : 0.0f);   /* A = roll left  */
+        stick_tgt[2] += (platform_key_down(pl, MU_KEY_E) ?  1.0f : 0.0f)   /* E = yaw right  */
+                    + (platform_key_down(pl, MU_KEY_Q) ? -1.0f : 0.0f);   /* Q = yaw left   */
+
+        /* Slew-rate limit: the stick has mass. 6 rad/s is brisk but not
+         * instant, so corrections take a moment and holding a turn is easy. */
+        const float slew = 6.0f * d->dt;
+        for (int k = 0; k < 3; ++k) {
+            float step = stick_tgt[k] - a->stick[k];
+            a->stick[k] += mu_clamp(step, -slew, slew);
+        }
+
+        /* Throttle: Z down, C up. A lever, not a tap — hold to move it. */
+        const float thr = (platform_key_down(pl, MU_KEY_C) ? 0.5f : 0.0f)
+                        - (platform_key_down(pl, MU_KEY_Z) ? 0.5f : 0.0f);
         a->sim.player.cmd_throttle = mu_clamp(a->sim.player.cmd_throttle + thr * d->dt, 0.0f, 1.0f);
+
+        /* Mouse look: right-drag looks around the cockpit. The offset decays
+         * back to centre when released so the view recentres on its own. */
+        if (a->camera == CAM_COCKPIT && mu_input_mouse_down(in, MU_MOUSE_RIGHT)) {
+            a->look_yaw   -= in->mouse_dx * 0.003f;
+            a->look_pitch += in->mouse_dy * 0.003f;
+            a->look_pitch  = mu_clamp(a->look_pitch, -1.3f, 1.3f);
+        } else {
+            a->look_yaw   *= 1.0f - 8.0f * d->dt;
+            a->look_pitch *= 1.0f - 8.0f * d->dt;
+        }
 
         if (platform_key_pressed(pl, MU_KEY_F)) a->flight_model ^= 1u;
         if (platform_key_pressed(pl, MU_KEY_C)) a->cloud_mode = (a->cloud_mode + 1u) % 5u;
@@ -299,9 +332,9 @@ static void app_update(App *a)
         if (in->wheel_y != 0.0f)
             a->orbit_dist = mu_clamp(a->orbit_dist * powf(0.9f, in->wheel_y), 25.0f, 4000.0f);
     }
-    a->sim.player.cmd[0] = mu_clamp(ctl[0], -1.0f, 1.0f);
-    a->sim.player.cmd[1] = mu_clamp(ctl[1], -1.0f, 1.0f);
-    a->sim.player.cmd[2] = mu_clamp(ctl[2], -1.0f, 1.0f);
+    a->sim.player.cmd[0] = mu_clamp(a->stick[0], -1.0f, 1.0f);
+    a->sim.player.cmd[1] = mu_clamp(a->stick[1], -1.0f, 1.0f);
+    a->sim.player.cmd[2] = mu_clamp(a->stick[2], -1.0f, 1.0f);
     /* Speedbrake is drag the pilot adds, and the 6-DOF model is the only one
      * that has a drag term to add it to. */
     a->sim.model.cd0 = fs_model_default.cd0 + a->speedbrake * 0.045f;
@@ -375,7 +408,15 @@ static void app_update(App *a)
             for (int k = 0; k < 3; ++k) target[k] = p->pos[k] + R[k] * 60.0f;
             up_hint[0] = R[4]; up_hint[1] = R[5]; up_hint[2] = R[6];
         } else {
-            for (int k = 0; k < 3; ++k) target[k] = a->eye[k] + R[k] * 1000.0f;
+            /* Cockpit view with mouse look: offset the look direction so the
+             * player can look around without the aircraft moving. The offset
+             * decays back to centre when the mouse button is released. */
+            float   ly = a->look_yaw, lp = a->look_pitch;
+            float   cp = cosf(lp), sp = sinf(lp);
+            float   sy = sinf(ly), cy = cosf(ly);
+            float   ldir[3] = {sy * cp, sp, -cy * cp};   /* look offset in world axes */
+            for (int k = 0; k < 3; ++k)
+                target[k] = a->eye[k] + R[k] * 1000.0f + ldir[k] * 80.0f;
             /* The aircraft's own -Z is up. Using it instead of the world's +Y is
              * what makes the horizon roll in the cockpit view, rather than the
              * camera staying level and the world tilting around it. */
@@ -451,7 +492,7 @@ static void app_update(App *a)
         hud_text(a, -ar + 0.04f, -0.22f, 0.75f, "THR %3.0F", (double)(p->throttle * 100.0f));
         hud_text(a, -ar + 0.04f, -0.14f, 0.75f, "FUEL %3.0F", (double)(a->fuel * 100.0f));
         hud_text(a, -ar + 0.04f, -0.06f, 0.75f, "TRF %2.0F", (double)a->sim.traffic_count);
-        hud_text(a, ar - 0.62f, -0.94f, 0.55f, "F MODEL  C CLOUDS  V VIEW  R RESET");
+        hud_text(a, ar - 0.62f, -0.94f, 0.55f, "WASD FLY  QE YAW  ZC THR  RMB LOOK");
     }
 
     demo_upload(d, a->text_list, a->hud_items, (uint64_t)a->hud_count * sizeof(HudItem));
