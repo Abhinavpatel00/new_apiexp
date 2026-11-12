@@ -90,6 +90,9 @@ mu_add_demo(gpu_driven demos/gpu_driven/main.c)
 mu_add_demo(oit demos/oit/main.c)
 mu_add_demo(taa demos/taa/main.c)
 mu_add_demo(clay demos/clay/main.c)
+mu_add_demo(flightsim demos/flightsim/main.c demos/flightsim/flight.c demos/flightsim/world.c)
+target_include_directories(flightsim PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/demos/flightsim
+    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/mu_lib/mu)
 mu_add_demo(bricks demos/bricks/main.c)
 mu_add_demo(screenspace demos/screenspace/main.c)
 mu_add_demo(ocean demos/ocean/main.c)
@@ -143,7 +146,7 @@ endfunction()
 
 mu_add_shader_target(galaxy_shaders common galaxy)
 mu_add_shader_target(toon_shaders common toon)
-mu_add_shader_target(shaders common toon galaxy slang-toon sdf post shadows particles pbr deferred clustered sdfworld fluid jfa gpu_driven oit taa clay bricks screenspace ocean lines blackhole turing schrodinger mpm pat snow pointlight)
+mu_add_shader_target(shaders common toon galaxy slang-toon sdf post shadows particles pbr deferred clustered sdfworld fluid jfa gpu_driven oit taa clay flightsim bricks screenspace ocean lines blackhole turing schrodinger mpm pat snow pointlight)
 
 # The two Slang toon packages under demos/ keep their own build.sh so they can
 # be vendored on their own; these targets run it.

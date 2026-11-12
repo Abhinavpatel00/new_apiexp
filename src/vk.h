@@ -20,7 +20,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
-
+#include "../third_party/mu_lib/mu/mu_common.h"
 #include <vulkan/vulkan_core.h> /* Vk types for WSI integration and optional escape */
 
 #ifndef ALIGNAS
@@ -934,6 +934,21 @@ uint32_t sampler_bindless_index(const Gpu *g, Sampler s);
 /* Resolve a render target to the underlying texture when an operation accepts
  * a texture handle rather than a target handle (for example readback). */
 Texture target_texture(const Gpu *g, Target target);
+/// inline helpers 
+
+
+
+MU_INLINE PassDesc *compute_pass(PassDesc *p, const char *name, Pipe pipe, BufUse *reads, uint32_t read_count,
+                              BufUse *writes, uint32_t write_count) {
+    memset(p, 0, sizeof *p);
+    strcpy(p->name, name);
+    p->kind = PASS_COMPUTE;
+    p->pipe = pipe;
+    p->buf_reads = reads; p->buf_read_count = read_count;
+    p->buf_writes = writes; p->buf_write_count = write_count;
+    return p;
+}
+
 
 
 

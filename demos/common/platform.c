@@ -4,7 +4,7 @@
  * edges), scancode control slots, layout-aware labels, focus-loss reset, wheel
  * accumulation, and gamepad polling with synthesized button edges.
  */
-
+            
 #include "platform.h"
 
 #define GLFW_INCLUDE_NONE
