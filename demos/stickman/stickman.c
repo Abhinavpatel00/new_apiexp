@@ -164,12 +164,14 @@ static void set_model(DemoObject *o, float x,float y,float z, float yaw, float s
     o->color[0]=col[0]; o->color[1]=col[1]; o->color[2]=col[2]; o->color[3]=col[3];
 }
 
-static void set_model_trs(DemoObject *o, const float t[3], const float q[4], float scale, const float col[4]){
-    float m[16];
-    mu_mat4_trs(m, t, q, (float[3]){scale,scale,scale});
-    // capsule is unit radius & height ±1, so stretch Y to desired half-length
-    memcpy(o->model, m, sizeof m);
-    o->color[0]=col[0]; o->color[1]=col[1]; o->color[2]=col[2]; o->color[3]=col[3];
+static void place_limb(DemoObject *o, float jx,float jy,float jz, const float q[4], float len, float rad, const float col[4]){
+    float dir[3]={0,-1,0}; // down
+    float d2[3]; mu_quat_rotate_vec3(d2, q, dir);
+    float mid[3]={jx + d2[0]*len*0.5f, jy + d2[1]*len*0.5f, jz + d2[2]*len*0.5f};
+    float sc[3]={rad, len*0.5f, rad};
+    float m[16]; mu_mat4_trs(m, mid, q, sc);
+    memcpy(o->model,m,sizeof m);
+    o->color[0]=col[0]; o->color[1]=col[1]; o->color[2]=col[2]; o->color[3]=1;
 }
 
 bool stickman_build(Stickman *s, StickmanParams p, bool with_pickaxe){
@@ -185,14 +187,14 @@ bool stickman_build(Stickman *s, StickmanParams p, bool with_pickaxe){
     DemoRange pickHandleR = add_box_range(&s->mesh, 0.02f, 0.35f, 0.02f);
     DemoRange pickHeadR   = add_box_range(&s->mesh, 0.14f, 0.03f, 0.04f);
 
-    s->range[STICK_HEAD]=headR;
-    s->range[STICK_TORSO]=torsoR;
-    s->range[STICK_ARM_L_UP]=limbR; s->range[STICK_ARM_L_LO]=limbR;
-    s->range[STICK_ARM_R_UP]=limbR; s->range[STICK_ARM_R_LO]=limbR;
-    s->range[STICK_LEG_L_UP]=limbR; s->range[STICK_LEG_L_LO]=limbR;
-    s->range[STICK_LEG_R_UP]=limbR; s->range[STICK_LEG_R_LO]=limbR;
-    s->range[STICK_PICK_HANDLE]=pickHandleR;
-    s->range[STICK_PICK_HEAD]=pickHeadR;
+    s->ranges[STICK_HEAD]=headR;
+    s->ranges[STICK_TORSO]=torsoR;
+    s->ranges[STICK_ARM_L_UP]=limbR; s->ranges[STICK_ARM_L_LO]=limbR;
+    s->ranges[STICK_ARM_R_UP]=limbR; s->ranges[STICK_ARM_R_LO]=limbR;
+    s->ranges[STICK_LEG_L_UP]=limbR; s->ranges[STICK_LEG_L_LO]=limbR;
+    s->ranges[STICK_LEG_R_UP]=limbR; s->ranges[STICK_LEG_R_LO]=limbR;
+    s->ranges[STICK_PICK_HANDLE]=pickHandleR;
+    s->ranges[STICK_PICK_HEAD]=pickHeadR;
 
     s->height = p.head_y + p.head_radius;
     // initial pose
@@ -200,162 +202,133 @@ bool stickman_build(Stickman *s, StickmanParams p, bool with_pickaxe){
     return true;
 }
 
+/* The pickaxe: handle sticking out of the fist along the arm's own axis, head at its tip. */
+static void place_pick(Stickman *s, const float hand[3], float pitch){
+    float q[4], down[3]={0,-1,0}, dir[3], m[16];
+    mu_quat_axis_angle(q, (float[3]){1,0,0}, pitch);
+    mu_quat_rotate_vec3(dir, q, down);
+    mu_mat4_trs(m, (float[3]){hand[0]+dir[0]*0.10f, hand[1]+dir[1]*0.10f, hand[2]+dir[2]*0.10f}, q, (float[3]){1,1,1});
+    memcpy(s->pose[STICK_PICK_HANDLE].model, m, sizeof m);
+    s->pose[STICK_PICK_HANDLE].color[0]=0.55f; s->pose[STICK_PICK_HANDLE].color[1]=0.35f;
+    s->pose[STICK_PICK_HANDLE].color[2]=0.15f; s->pose[STICK_PICK_HANDLE].color[3]=1.0f;
+    mu_mat4_trs(m, (float[3]){hand[0]+dir[0]*0.45f, hand[1]+dir[1]*0.45f, hand[2]+dir[2]*0.45f}, q, (float[3]){1,1,1});
+    memcpy(s->pose[STICK_PICK_HEAD].model, m, sizeof m);
+    s->pose[STICK_PICK_HEAD].color[0]=0.60f; s->pose[STICK_PICK_HEAD].color[1]=0.60f;
+    s->pose[STICK_PICK_HEAD].color[2]=0.65f; s->pose[STICK_PICK_HEAD].color[3]=1.0f;
+}
+
 void stickman_pose_idle(Stickman *s, float t){
-    StickmanParams *p=&s->params;
+    StickmanParams *p = &s->params;
     float breathe = sinf(t*1.2f)*0.008f;
+    float yShoulder, yHip, hand[3];
+    float qDown[4], qDownR[4], d2[3];
 
-    // head: slight bob
+    /* head and torso: the torso is one capsule scaled to an ellipse */
     set_model(&s->pose[STICK_HEAD], 0, p->head_y + breathe, 0, 0, p->head_radius, p->col_head);
-
-    // torso: single capsule scaled non-uniformly: radius XZ, half_h Y
-    // We encode non-uniform scale via model matrix columns
     {
-        DemoObject *o=&s->pose[STICK_TORSO];
-        memset(o,0,sizeof *o);
-        o->model[0]=p->torso_radius; o->model[5]=p->torso_half_h; o->model[10]=p->torso_radius;
-        o->model[12]=0; o->model[13]=p->head_y - p->head_radius - p->torso_half_h + 0.08f; o->model[14]=0; o->model[15]=1;
-        o->color[0]=p->col_body[0]; o->color[1]=p->col_body[1]; o->color[2]=p->col_body[2]; o->color[3]=1;
+        DemoObject *o = &s->pose[STICK_TORSO];
+        memset(o, 0, sizeof *o);
+        o->model[0] = p->torso_radius; o->model[5] = p->torso_half_h; o->model[10] = p->torso_radius;
+        o->model[13] = p->head_y - p->head_radius - p->torso_half_h + 0.08f; o->model[15] = 1.0f;
+        o->color[0] = p->col_body[0]; o->color[1] = p->col_body[1];
+        o->color[2] = p->col_body[2]; o->color[3] = 1.0f;
     }
+    yShoulder = s->pose[STICK_TORSO].model[13] + p->torso_half_h*0.85f;
+    yHip      = s->pose[STICK_TORSO].model[13] - p->torso_half_h*0.90f;
 
-    float yShoulder = s->pose[STICK_TORSO].model[13] + p->torso_half_h*0.85f;
-    float yHip = s->pose[STICK_TORSO].model[13] - p->torso_half_h*0.9f;
+    /* arms hang straight down, slightly out */
+    mu_quat_axis_angle(qDown,  (float[3]){0,0,1},  0.15f);
+    mu_quat_axis_angle(qDownR, (float[3]){0,0,1}, -0.15f);
+    place_limb(&s->pose[STICK_ARM_L_UP], -0.18f, yShoulder, 0, qDown, p->arm_upper_len, p->limb_radius, p->col_body);
+    place_limb(&s->pose[STICK_ARM_R_UP],  0.18f, yShoulder, 0, qDownR, p->arm_upper_len, p->limb_radius, p->col_body);
+    mu_quat_rotate_vec3(d2, qDown, (float[3]){0,-1,0});
+    place_limb(&s->pose[STICK_ARM_L_LO], -0.18f + d2[0]*p->arm_upper_len, yShoulder + d2[1]*p->arm_upper_len, 0,
+               qDown, p->arm_lower_len, p->limb_radius*0.9f, p->col_body);
+    mu_quat_rotate_vec3(d2, qDownR, (float[3]){0,-1,0});
+    place_limb(&s->pose[STICK_ARM_R_LO], 0.18f + d2[0]*p->arm_upper_len, yShoulder + d2[1]*p->arm_upper_len, 0,
+               qDownR, p->arm_lower_len, p->limb_radius*0.9f, p->col_body);
 
-    // arms hang straight down, slightly out
-    float qDown[4]; mu_quat_axis_angle(qDown, (float[3]){0,0,1}, 0.15f);
-    float qDownR[4]; mu_quat_axis_angle(qDownR, (float[3]){0,0,1}, -0.15f);
-
-    float tL[3]={-0.18f, yShoulder, 0}, tR[3]={0.18f, yShoulder, 0};
-    // upper arm: translate to shoulder, rotate, scale Y = length
-    // we store capsule radius via model scale, length via Y scale
-    // limbR is unit capsule (r=1, h=±1 => total height 2). So scale = desired.
-    // For limbs we need to offset pivot: capsule center should be at mid-point of bone
-    // Easiest: model = T_shoulder * R * T(0,-arm_upper_len,0) * S(r, len, r) but since mesh centered, just T_shoulder + offset along rotated -Y
-    // Simplified: build TRS then translate along local Y before scale: we'll just compose manually
-    float sArm = p->limb_radius;
-    float lenUp = p->arm_upper_len, lenLo = p->arm_lower_len;
-    // helper to place limb: position = joint + dir*len/2, orientation = dir rotation
-    // For idle, dir = (0,-1,0) with slight outward tilt
-    auto void place_limb(DemoObject *o, float jx,float jy,float jz, float q[4], float len, float rad, const float col[4]){
-        float dir[3]={0,-1,0}; // down
-        // rotate dir by quat
-        float d2[3]; mu_quat_rotate(d2, q, dir);
-        float mid[3]={jx + d2[0]*len*0.5f, jy + d2[1]*len*0.5f, jz + d2[2]*len*0.5f};
-        float qs[4]; memcpy(qs,q,sizeof qs);
-        // build matrix: T(mid) * R(q) * S(rad, len/2 ?, wait capsule height is 2 units -> scale Y should be len/2 ???)
-        // Unit capsule: total height = 2 (cylinder) + 2*radius caps? Actually our capsule is r=1, h=±1 => total 4? Wait: cylinder 2 + caps 2 =4. But we scaled uniformly before. For limb we want length = len. So scaleY = len / 2.0f (since base height 2 in Y? Let's check: cylinder from -1 to +1 => height 2, plus caps radius 1 each => total 4. Hmm to keep limb length exact, use len/2.0f).
-        // Let's approximate: scaleY = len/2.0f, scaleXZ = rad
-        float sc[3]={rad, len*0.5f, rad};
-        float m[16]; mu_mat4_trs(m, mid, qs, sc);
-        memcpy(o->model,m,sizeof m);
-        o->color[0]=col[0]; o->color[1]=col[1]; o->color[2]=col[2]; o->color[3]=1;
-    }
-
-    place_limb(&s->pose[STICK_ARM_L_UP], tL[0],tL[1],tL[2], qDown, lenUp, sArm, p->col_body);
-    // elbow
+    /* legs: straight down */
     {
-        float dir[3]={0,-1,0}; float d2[3]; mu_quat_rotate(d2,qDown,dir);
-        float elbow[3]={tL[0]+d2[0]*lenUp, tL[1]+d2[1]*lenUp, tL[2]+d2[2]*lenUp};
-        place_limb(&s->pose[STICK_ARM_L_LO], elbow[0],elbow[1],elbow[2], qDown, lenLo, sArm*0.9f, p->col_body);
-    }
-    place_limb(&s->pose[STICK_ARM_R_UP], tR[0],tR[1],tR[2], qDownR, lenUp, sArm, p->col_body);
-    {
-        float dir[3]={0,-1,0}; float d2[3]; mu_quat_rotate(d2,qDownR,dir);
-        float elbow[3]={tR[0]+d2[0]*lenUp, tR[1]+d2[1]*lenUp, tR[2]+d2[2]*lenUp};
-        place_limb(&s->pose[STICK_ARM_R_LO], elbow[0],elbow[1],elbow[2], qDownR, lenLo, sArm*0.9f, p->col_body);
+        float qLeg[4];
+        mu_quat_identity(qLeg);
+        place_limb(&s->pose[STICK_LEG_L_UP], -0.09f, yHip, 0, qLeg, p->leg_upper_len, p->limb_radius*1.1f, p->col_body);
+        place_limb(&s->pose[STICK_LEG_R_UP],  0.09f, yHip, 0, qLeg, p->leg_upper_len, p->limb_radius*1.1f, p->col_body);
+        place_limb(&s->pose[STICK_LEG_L_LO], -0.09f, yHip - p->leg_upper_len, 0, qLeg, p->leg_lower_len, p->limb_radius, p->col_body);
+        place_limb(&s->pose[STICK_LEG_R_LO],  0.09f, yHip - p->leg_upper_len, 0, qLeg, p->leg_lower_len, p->limb_radius, p->col_body);
     }
 
-    // legs: straight
-    float qLeg[4]; mu_quat_axis_angle(qLeg, (float[3]){0,0,1}, 0.0f);
-    place_limb(&s->pose[STICK_LEG_L_UP], -0.09f, yHip, 0, qLeg, p->leg_upper_len, p->limb_radius*1.1f, p->col_body);
-    {
-        float knee[3]={-0.09f, yHip - p->leg_upper_len, 0};
-        place_limb(&s->pose[STICK_LEG_L_LO], knee[0],knee[1],knee[2], qLeg, p->leg_lower_len, p->limb_radius, p->col_body);
+    if (s->has_pickaxe) {
+        mu_quat_rotate_vec3(d2, qDownR, (float[3]){0,-1,0});
+        hand[0] = 0.18f + d2[0]*(p->arm_upper_len + p->arm_lower_len);
+        hand[1] = yShoulder + d2[1]*(p->arm_upper_len + p->arm_lower_len);
+        hand[2] = 0.0f;
+        place_pick(s, hand, 0.0f);
     }
-    place_limb(&s->pose[STICK_LEG_R_UP], 0.09f, yHip, 0, qLeg, p->leg_upper_len, p->limb_radius*1.1f, p->col_body);
-    {
-        float knee[3]={0.09f, yHip - p->leg_upper_len, 0};
-        place_limb(&s->pose[STICK_LEG_R_LO], knee[0],knee[1],knee[2], qLeg, p->leg_lower_len, p->limb_radius, p->col_body);
-    }
+}
 
-    if(s->has_pickaxe){
-        // pick parented to right hand
-        float hand[3]; { float dir[3]={0,-1,0}; float d2[3]; mu_quat_rotate(d2,qDownR,dir); hand[0]=tR[0]+d2[0]*lenUp + d2[0]*lenLo; hand[1]=tR[1]+d2[1]*lenUp + d2[1]*lenLo; hand[2]=0; }
-        // handle
-        DemoObject *h=&s->pose[STICK_PICK_HANDLE];
-        float qPick[4]; mu_quat_axis_angle(qPick, (float[3]){0,0,1}, 0.6f);
-        float m2[16], qComb[4]; mu_quat_mul(qComb, qDownR, qPick);
-        mu_mat4_trs(m2, (float[3]){hand[0]+0.05f, hand[1]+0.1f, 0}, qComb, (float[3]){1,1,1});
-        memcpy(h->model,m2,sizeof m2); h->color[0]=0.55f;h->color[1]=0.35f;h->color[2]=0.15f;h->color[3]=1;
-        DemoObject *ph=&s->pose[STICK_PICK_HEAD];
-        mu_mat4_trs(m2, (float[3]){hand[0]+0.05f, hand[1]+0.45f, 0}, qComb, (float[3]){1,1,1});
-        memcpy(ph->model,m2,sizeof m2); ph->color[0]=0.6f;ph->color[1]=0.6f;ph->color[2]=0.65f;ph->color[3]=1;
-    }
+/* One bone: upper from the joint at `pitch` about X, lower continuing from its end. */
+static void pose_chain(Stickman *s, StickmanPart up, StickmanPart lo, float x, float y,
+                       float pitch, float up_len, float lo_len, float rad, float bend){
+    StickmanParams *p = &s->params;
+    float q[4], dir[3], elbow[3];
+    mu_quat_axis_angle(q, (float[3]){1,0,0}, pitch);
+    mu_quat_rotate_vec3(dir, q, (float[3]){0,-1,0});
+    place_limb(&s->pose[up], x, y, 0, q, up_len, rad, p->col_body);
+    elbow[0] = x + dir[0]*up_len;
+    elbow[1] = y + dir[1]*up_len;
+    elbow[2] = dir[2]*up_len;
+    mu_quat_axis_angle(q, (float[3]){1,0,0}, pitch + bend);
+    mu_quat_rotate_vec3(dir, q, (float[3]){0,-1,0});
+    place_limb(&s->pose[lo], elbow[0], elbow[1], elbow[2], q, lo_len, rad*0.9f, p->col_body);
 }
 
 void stickman_pose_walk(Stickman *s, float t, float speed){
-    stickman_pose_idle(s,t); // base
-    float phase = t*speed*5.0f;
-    float swing = sinf(phase)*0.55f;
-    float swing2= sinf(phase + 0.6f)*0.45f;
-    // overwrite arm rotations with swing
-    // left arm forward when right leg forward (opposite)
-    // We'll just perturb the idle quats
-    // For brevity we recompute shoulders with pitch X rotation
-    StickmanParams *p=&s->params;
-    float yShoulder = s->pose[STICK_TORSO].model[13] + p->torso_half_h*0.85f;
-    float yHip = s->pose[STICK_TORSO].model[13] - p->torso_half_h*0.9f;
+    StickmanParams *p = &s->params;
+    float phase  = t*speed*5.0f;
+    float swing  = sinf(phase)*0.55f;
+    float yShoulder, yHip, hand[3], q[4], dir[3];
 
-    auto void place_limb_pitched(DemoObject *o,float jx,float jy,float jz,float pitch, float len, float rad){
-        float q[4]; mu_quat_axis_angle(q, (float[3]){1,0,0}, pitch);
-        float qOut[4]; mu_quat_axis_angle(qOut, (float[3]){0,0,1}, 0.1f);
-        float q2[4]; mu_quat_mul(q2, q, qOut);
-        float dir[3]={0,-1,0}; float d2[3]; mu_quat_rotate(d2,q2,dir);
-        float mid[3]={jx+d2[0]*len*0.5f, jy+d2[1]*len*0.5f, jz+d2[2]*len*0.5f};
-        float m[16]; mu_mat4_trs(m, mid, q2, (float[3]){rad, len*0.5f, rad});
-        memcpy(o->model,m,sizeof m);
+    stickman_pose_idle(s, t);
+    yShoulder = s->pose[STICK_TORSO].model[13] + p->torso_half_h*0.85f;
+    yHip      = s->pose[STICK_TORSO].model[13] - p->torso_half_h*0.90f;
+
+    /* arms counter the legs, knees and elbows bend slightly */
+    pose_chain(s, STICK_ARM_L_UP, STICK_ARM_L_LO, -0.18f, yShoulder,  swing, p->arm_upper_len, p->arm_lower_len, p->limb_radius, -0.30f);
+    pose_chain(s, STICK_ARM_R_UP, STICK_ARM_R_LO,  0.18f, yShoulder, -swing, p->arm_upper_len, p->arm_lower_len, p->limb_radius, -0.30f);
+    pose_chain(s, STICK_LEG_L_UP, STICK_LEG_L_LO, -0.09f, yHip, -swing, p->leg_upper_len, p->leg_lower_len, p->limb_radius*1.1f, 0.35f);
+    pose_chain(s, STICK_LEG_R_UP, STICK_LEG_R_LO,  0.09f, yHip,  swing, p->leg_upper_len, p->leg_lower_len, p->limb_radius*1.1f, 0.35f);
+
+    if (s->has_pickaxe) {
+        mu_quat_axis_angle(q, (float[3]){1,0,0}, -swing - 0.30f);
+        mu_quat_rotate_vec3(dir, q, (float[3]){0,-1,0});
+        hand[0] = 0.18f + dir[0]*(p->arm_upper_len + p->arm_lower_len);
+        hand[1] = yShoulder + dir[1]*(p->arm_upper_len + p->arm_lower_len);
+        hand[2] = dir[2]*(p->arm_upper_len + p->arm_lower_len);
+        place_pick(s, hand, -swing - 0.30f);
     }
-    place_limb_pitched(&s->pose[STICK_ARM_L_UP], -0.18f,yShoulder,0, swing, p->arm_upper_len, p->limb_radius);
-    place_limb_pitched(&s->pose[STICK_ARM_L_LO], -0.18f,yShoulder - p->arm_upper_len*0.9f, 0.08f*sinf(phase)*0.3f, swing+swing2*0.5f, p->arm_lower_len, p->limb_radius*0.9f);
-    place_limb_pitched(&s->pose[STICK_ARM_R_UP], 0.18f,yShoulder,0, -swing, p->arm_upper_len, p->limb_radius);
-    place_limb_pitched(&s->pose[STICK_ARM_R_LO], 0.18f,yShoulder + p->arm_upper_len*0.9f*sinf(phase+3.14f)*0.2f, 0, -swing - swing2*0.5f, p->arm_lower_len, p->limb_radius*0.9f);
-
-    place_limb_pitched(&s->pose[STICK_LEG_L_UP], -0.09f,yHip,0, -swing, p->leg_upper_len, p->limb_radius*1.1f);
-    place_limb_pitched(&s->pose[STICK_LEG_R_UP], 0.09f,yHip,0, swing, p->leg_upper_len, p->limb_radius*1.1f);
-    place_limb_pitched(&s->pose[STICK_LEG_L_LO], -0.09f,yHip - p->leg_upper_len, -0.06f, -swing*0.4f, p->leg_lower_len, p->limb_radius);
-    place_limb_pitched(&s->pose[STICK_LEG_R_LO], 0.09f,yHip - p->leg_upper_len, 0.06f, swing*0.4f, p->leg_lower_len, p->limb_radius);
 }
 
 void stickman_pose_mine(Stickman *s, float t){
-    stickman_pose_idle(s,t);
-    StickmanParams *p=&s->params;
-    float swing = powf(sinf(t*7.0f)*0.5f+0.5f, 1.8f) * 1.7f; // 0..1.7 rad slam
-    float yShoulder = s->pose[STICK_TORSO].model[13] + p->torso_half_h*0.85f;
-    float pitch = -1.0f - swing; // overhead
-    auto void place_both_arms(float pitch){
-        float q[4]; mu_quat_axis_angle(q, (float[3]){1,0,0}, pitch);
-        float qL[4], qR[4]; mu_quat_axis_angle(qL, (float[3]){0,0,1}, 0.25f); mu_quat_mul(qL,q,qL);
-        mu_quat_axis_angle(qR, (float[3]){0,0,1}, -0.25f); mu_quat_mul(qR,q,qR);
-        float dirL[3]={0,-1,0}, dirR[3]={0,-1,0}; float dL[3], dR[3];
-        mu_quat_rotate(dL,qL,dirL); mu_quat_rotate(dR,qR,dirR);
-        float midL[3]={-0.16f+dL[0]*p->arm_upper_len*0.5f, yShoulder+dL[1]*p->arm_upper_len*0.5f, dL[2]*p->arm_upper_len*0.5f};
-        float midR[3]={ 0.16f+dR[0]*p->arm_upper_len*0.5f, yShoulder+dR[1]*p->arm_upper_len*0.5f, dR[2]*p->arm_upper_len*0.5f};
-        float m[16];
-        mu_mat4_trs(m, midL, qL, (float[3]){p->limb_radius, p->arm_upper_len*0.5f, p->limb_radius}); memcpy(s->pose[STICK_ARM_L_UP].model,m,sizeof m);
-        mu_mat4_trs(m, midR, qR, (float[3]){p->limb_radius, p->arm_upper_len*0.5f, p->limb_radius}); memcpy(s->pose[STICK_ARM_R_UP].model,m,sizeof m);
-        float elbowL[3]={-0.16f+dL[0]*p->arm_upper_len, yShoulder+dL[1]*p->arm_upper_len, dL[2]*p->arm_upper_len};
-        float elbowR[3]={ 0.16f+dR[0]*p->arm_upper_len, yShoulder+dR[1]*p->arm_upper_len, dR[2]*p->arm_upper_len};
-        float midLL[3]={elbowL[0]+dL[0]*p->arm_lower_len*0.5f, elbowL[1]+dL[1]*p->arm_lower_len*0.5f, elbowL[2]+dL[2]*p->arm_lower_len*0.5f};
-        float midRL[3]={elbowR[0]+dR[0]*p->arm_lower_len*0.5f, elbowR[1]+dR[1]*p->arm_lower_len*0.5f, elbowR[2]+dR[2]*p->arm_lower_len*0.5f};
-        mu_mat4_trs(m, midLL, qL, (float[3]){p->limb_radius*0.9f, p->arm_lower_len*0.5f, p->limb_radius*0.9f}); memcpy(s->pose[STICK_ARM_L_LO].model,m,sizeof m);
-        mu_mat4_trs(m, midRL, qR, (float[3]){p->limb_radius*0.9f, p->arm_lower_len*0.5f, p->limb_radius*0.9f}); memcpy(s->pose[STICK_ARM_R_LO].model,m,sizeof m);
-        if(s->has_pickaxe){
-            float hand[3]={elbowR[0]+dR[0]*p->arm_lower_len, elbowR[1]+dR[1]*p->arm_lower_len, elbowR[2]+dR[2]*p->arm_lower_len};
-            mu_mat4_trs(s->pose[STICK_PICK_HANDLE].model, (float[3]){hand[0],hand[1],hand[2]}, qR, (float[3]){1,1,1});
-            mu_mat4_trs(s->pose[STICK_PICK_HEAD].model, (float[3]){hand[0]+dR[0]*0.35f, hand[1]+dR[1]*0.35f, hand[2]+dR[2]*0.35f}, qR, (float[3]){1,1,1});
-        }
+    StickmanParams *p = &s->params;
+    float swing = powf(sinf(t*7.0f)*0.5f + 0.5f, 1.8f) * 1.6f;
+    float pitch = -1.9f - swing;                        /* overhead, slamming down */
+    float yShoulder, hand[3], q[4], dir[3];
+
+    stickman_pose_idle(s, t);
+    yShoulder = s->pose[STICK_TORSO].model[13] + p->torso_half_h*0.85f;
+
+    pose_chain(s, STICK_ARM_L_UP, STICK_ARM_L_LO, -0.18f, yShoulder, pitch, p->arm_upper_len, p->arm_lower_len, p->limb_radius, -0.15f);
+    pose_chain(s, STICK_ARM_R_UP, STICK_ARM_R_LO,  0.18f, yShoulder, pitch, p->arm_upper_len, p->arm_lower_len, p->limb_radius, -0.15f);
+
+    if (s->has_pickaxe) {
+        mu_quat_axis_angle(q, (float[3]){1,0,0}, pitch - 0.15f);
+        mu_quat_rotate_vec3(dir, q, (float[3]){0,-1,0});
+        hand[0] = 0.18f + dir[0]*(p->arm_upper_len + p->arm_lower_len);
+        hand[1] = yShoulder + dir[1]*(p->arm_upper_len + p->arm_lower_len);
+        hand[2] = dir[2]*(p->arm_upper_len + p->arm_lower_len);
+        place_pick(s, hand, pitch - 0.15f);
     }
-    place_both_arms(pitch);
 }
 
 void stickman_free(Stickman *s){ demo_mesh_free(&s->mesh); memset(s,0,sizeof *s); }
-

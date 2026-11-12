@@ -123,7 +123,9 @@ mu_add_demo(contact demos/contact/main.c demos/contact/method.c)
 mu_add_demo(koopman demos/koopman/main.c demos/koopman/method.c)
 mu_add_demo(detective_world demos/detective_world/main.c)
 
-mu_add_demo(stickman demo/stickman/main.c)
+mu_add_demo(stickman demos/stickman/main.c demos/stickman/stickman.c)
+target_include_directories(stickman PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/demos/stickman
+    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/mu_lib/mu)
 
 # The network of demos/pat is 100 million multiply-adds a point.
 set_source_files_properties(demos/pat/method.c demos/snow/method.c demos/xpbd/method.c demos/projdyn/method.c demos/seiler/method.c demos/avbd/method.c demos/absnewton/method.c demos/waveparticles/method.c demos/mergesplit/method.c demos/ipbf/method.c demos/sampleelim/method.c demos/gogreen/method.c demos/c2spline/method.c demos/catmullrom/method.c demos/polyroots/method.c demos/wildmesh/method.c demos/softloco/method.c demos/contact/method.c demos/koopman/method.c PROPERTIES COMPILE_OPTIONS "-O3")
