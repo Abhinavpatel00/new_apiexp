@@ -96,10 +96,14 @@ static void app_frame(App *a) {
     demo_frame_end(d);
 }
 
-static void compute_pass(PassDesc *p, const char *name, Pipe pipe,
-                         Target *reads, uint32_t read_count, Target *write) {
+/* The image variant of the library's compute_pass(), which declares buffer
+ * ranges. This one declares whole textures: a fluid pass reads one or two
+ * images and writes exactly one. It takes a different pass name because vk.h
+ * already has compute_pass() and two different functions cannot share it. */
+static void compute_image_pass(PassDesc *p, const char *name, Pipe pipe,
+                               Target *reads, uint32_t read_count, Target *write) {
     memset(p, 0, sizeof *p);
-    strcpy(p->name, name);
+    pass_name_set(p->name, name);
     p->kind   = PASS_COMPUTE;
     p->pipe   = pipe;
     p->state  = draw_state_opaque(SC_1, CULL_NONE);
@@ -116,12 +120,12 @@ static uint32_t solver_passes(App *a, PassDesc *passes) {
     for (i = 0u; i < a->iterations; ++i) {
         const bool even = (i & 1u) == 0u;
         if (a->jacobi)
-            compute_pass(&passes[count++], even ? "JacobiA" : "JacobiB", a->jacobi_pipe,
+            compute_image_pass(&passes[count++], even ? "JacobiA" : "JacobiB", a->jacobi_pipe,
                          even ? a->reads_jacobi_even : a->reads_jacobi_odd, 2u, even ? &a->img[P1] : &a->img[P0]);
         else
-            compute_pass(&passes[count++], even ? "RelaxRed" : "RelaxBlack", a->relax_pipe, &a->img[DIV], 1u, &a->img[P0]);
+            compute_image_pass(&passes[count++], even ? "RelaxRed" : "RelaxBlack", a->relax_pipe, &a->img[DIV], 1u, &a->img[P0]);
     }
-    compute_pass(&passes[count++], "Project", a->project_pipe, a->reads_project, 2u, &a->img[U0]);
+    compute_image_pass(&passes[count++], "Project", a->project_pipe, a->reads_project, 2u, &a->img[U0]);
     return count;
 }
 
@@ -156,10 +160,10 @@ static void app_init(App *a) {
     a->reads_project[0] = a->img[U1]; a->reads_project[1] = a->img[P0];
     a->reads_show[0] = a->img[D0]; a->reads_show[1] = a->img[U0]; a->reads_show[2] = a->img[P0];
 
-    compute_pass(&passes[count++], "AdvectVelocity", a->advect_pipe, &a->img[U0], 1u, &a->img[U1]);
-    compute_pass(&passes[count++], "AdvectDye", a->advect_pipe, a->reads_dye, 2u, &a->img[D1]);
-    compute_pass(&passes[count++], "CopyDye", a->copy_pipe, &a->img[D1], 1u, &a->img[D0]);
-    compute_pass(&passes[count++], "Divergence", a->divergence_pipe, &a->img[U1], 1u, &a->img[DIV]);
+    compute_image_pass(&passes[count++], "AdvectVelocity", a->advect_pipe, &a->img[U0], 1u, &a->img[U1]);
+    compute_image_pass(&passes[count++], "AdvectDye", a->advect_pipe, a->reads_dye, 2u, &a->img[D1]);
+    compute_image_pass(&passes[count++], "CopyDye", a->copy_pipe, &a->img[D1], 1u, &a->img[D0]);
+    compute_image_pass(&passes[count++], "Divergence", a->divergence_pipe, &a->img[U1], 1u, &a->img[DIV]);
     count += solver_passes(a, &passes[count]);
     {
         PassDesc *p = &passes[count++];

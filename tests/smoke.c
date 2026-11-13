@@ -322,7 +322,7 @@ int main(void) {
 
     /* ---- verify REAL GPU output through readback -------------------------- */
     memset(readback, 0, sizeof readback);
-    rb = readback_request(g, tex, DATA_SPAN(readback, sizeof readback), 0u);
+    rb = readback_request(g, tex, DATA_SPAN(readback, sizeof readback));
     REQUIRE(rb != NULL, "readback_request: %s", gpu_last_error(g));
     REQUIRE(readback_ready(g, rb, true), "readback_ready(blocking)");
     printf("readback pixel[0]  = %u %u %u %u\n",
@@ -410,7 +410,7 @@ int main(void) {
         vd.cls = RES_PERSISTENT; vd.initial_data = &span;
         volume = texture_create(g, &vd);
         CHECK(HANDLE_VALID(volume), "texture_create(3D): %s", gpu_last_error(g));
-        vrb = readback_request(g, volume, DATA_SPAN(volume_back, sizeof volume_back), 0u);
+        vrb = readback_request(g, volume, DATA_SPAN(volume_back, sizeof volume_back));
         CHECK(vrb != NULL, "readback_request(3D): %s", gpu_last_error(g));
         for (tries = 0u; vrb && tries < 120u && !readback_ready(g, vrb, true); ++tries) {}
         if (vrb) readback_release(g, vrb);

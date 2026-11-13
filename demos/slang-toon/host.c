@@ -731,7 +731,7 @@ static bool render_headless(Host *h, const char *out_path) {
     }
     pixels = (uint8_t *)calloc(1u, bytes);
     if (!pixels) return false;
-    rb = readback_request(h->gpu, target_texture(h->gpu, h->color), DATA_SPAN(pixels, bytes), 0u);
+    rb = readback_request(h->gpu, target_texture(h->gpu, h->color), DATA_SPAN(pixels, bytes));
     /* readback_ready(blocking) waits one second per call. A software rasterizer
      * needs longer than that for the shadow-mapped frame, so ask again. */
     ok = false;
