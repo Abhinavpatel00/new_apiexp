@@ -716,7 +716,7 @@ static bool render_headless(Demo *d, const char *path) {
         free(pixels);
         return false;
     }
-    readback = readback_request(d->gpu, d->color_texture, DATA_SPAN(pixels, bytes), 0u);
+    readback = readback_request(d->gpu, d->color_texture, DATA_SPAN(pixels, bytes));
     if (!readback || !readback_ready(d->gpu, readback, true)) {
         fprintf(stderr, "[toon] readback failed: %s\n", gpu_last_error(d->gpu));
         if (readback)

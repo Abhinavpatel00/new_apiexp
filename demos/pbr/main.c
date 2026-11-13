@@ -187,7 +187,7 @@ static void app_frame(App *a) {
     demo_frame_end(d);
 }
 
-static void compute_pass(PassDesc *p, const char *name, Pipe pipe, const Target *read, const Target *write) {
+static void compute_image_pass(PassDesc *p, const char *name, Pipe pipe, const Target *read, const Target *write) {
     memset(p, 0, sizeof *p);
     strcpy(p->name, name);
     p->kind            = PASS_COMPUTE;
@@ -269,13 +269,13 @@ static void app_init(App *a) {
     a->forward_reads[LEVELS + 1u] = a->dfg;
 
     /* ---- bake: sky, four prefiltered levels, irradiance, DFG ---- */
-    compute_pass(&passes[count++], "Sky", a->sky_pipe, NULL, &a->level[0]);
+    compute_image_pass(&passes[count++], "Sky", a->sky_pipe, NULL, &a->level[0]);
     for (i = 1u; i < LEVELS; ++i) {
         snprintf(name, sizeof name, "Prefilter%u", i);
-        compute_pass(&passes[count++], name, a->prefilter_pipe, &a->level[0], &a->level[i]);
+        compute_image_pass(&passes[count++], name, a->prefilter_pipe, &a->level[0], &a->level[i]);
     }
-    compute_pass(&passes[count++], "Irradiance", a->irradiance_pipe, &a->level[0], &a->irradiance);
-    compute_pass(&passes[count++], "DFG", a->dfg_pipe, NULL, &a->dfg);
+    compute_image_pass(&passes[count++], "Irradiance", a->irradiance_pipe, &a->level[0], &a->irradiance);
+    compute_image_pass(&passes[count++], "DFG", a->dfg_pipe, NULL, &a->dfg);
 
     /* ---- frame ---- */
     first_frame_pass = count;

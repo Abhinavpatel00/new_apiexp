@@ -342,7 +342,7 @@ static void reset_balls(App *a) {
     demo_upload(d, a->args_data, zero, (MAX_BALLS + 1u) * 16u);
 }
 
-static void compute_pass(PassDesc *p, const char *name, Pipe pipe) {
+static void compute_pass_bare(PassDesc *p, const char *name, Pipe pipe) {
     memset(p, 0, sizeof *p);
     strcpy(p->name, name);
     p->kind   = PASS_COMPUTE;
@@ -410,44 +410,44 @@ static void app_init(App *a) {
      * the coarse level, then everything that reads the world. */
     {
         PassDesc *p = &passes[count++];
-        compute_pass(p, "Edit", a->edit_pipe);
+        compute_pass_bare(p, "Edit", a->edit_pipe);
         p->tex_writes = &a->fine;      p->tex_write_count = 1u;
         p->buf_reads  = a->edit_reads; p->buf_read_count  = 3u;
     }
     {
         PassDesc *p = &passes[count++];
-        compute_pass(p, "Occupied", a->occupied_pipe);
+        compute_pass_bare(p, "Occupied", a->occupied_pipe);
         p->tex_reads  = &a->fine;     p->tex_read_count  = 1u;
         p->tex_writes = &a->occupied; p->tex_write_count = 1u;
     }
     {
         PassDesc *p = &passes[count++];
-        compute_pass(p, "ReachX", a->reach_pipe);
+        compute_pass_bare(p, "ReachX", a->reach_pipe);
         p->tex_reads  = &a->occupied; p->tex_read_count  = 1u;
         p->tex_writes = &a->reach;    p->tex_write_count = 1u;
     }
     {
         PassDesc *p = &passes[count++];
-        compute_pass(p, "ReachY", a->reach_pipe);
+        compute_pass_bare(p, "ReachY", a->reach_pipe);
         p->tex_reads  = &a->reach;    p->tex_read_count  = 1u;
         p->tex_writes = &a->occupied; p->tex_write_count = 1u;
     }
     {
         PassDesc *p = &passes[count++];
-        compute_pass(p, "ReachZ", a->reach_pipe);
+        compute_pass_bare(p, "ReachZ", a->reach_pipe);
         p->tex_reads  = &a->occupied; p->tex_read_count  = 1u;
         p->tex_writes = &a->reach;    p->tex_write_count = 1u;
     }
     {
         PassDesc *p = &passes[count++];
-        compute_pass(p, "Pick", a->pick_pipe);
+        compute_pass_bare(p, "Pick", a->pick_pipe);
         p->tex_reads  = a->sim_reads;   p->tex_read_count  = 2u;
         p->buf_reads  = &a->frame_read; p->buf_read_count  = 1u;
         p->buf_writes = a->pick_writes; p->buf_write_count = 2u;
     }
     {
         PassDesc *p = &passes[count++];
-        compute_pass(p, "Balls", a->balls_pipe);
+        compute_pass_bare(p, "Balls", a->balls_pipe);
         p->tex_reads  = a->sim_reads;    p->tex_read_count  = 2u;
         p->buf_reads  = &a->frame_read;  p->buf_read_count  = 1u;
         p->buf_writes = a->balls_writes; p->buf_write_count = 3u;

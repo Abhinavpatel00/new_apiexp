@@ -77,6 +77,7 @@ typedef struct BufferSlot {
     VkDeviceMemory memory;
     VkDeviceSize mem_offset;   /* offset inside the arena's memory object    */
     uint64_t    size;
+    uint64_t    committed;     /* bytes of this buffer a command buffer may touch */
     uint64_t    align;
     uint32_t    usage;         /* BufferUsage                               */
     ResClass    cls;
@@ -108,6 +109,12 @@ typedef struct TargetSlot {
     uint32_t gen;
     bool     live;
     TextureSlot *tex;          /* resolved at the boundary, never re-checked */
+    /* Layout this target ended the PREVIOUS frame in. A transient target is
+     * re-derived every frame and its texture is rewritten at the top of the
+     * frame program, so the plan's baked-in oldLayout (UNDEFINED) is right for
+     * it; a persistent target keeps its real layout here and the barrier takes
+     * it at record time. */
+    VkImageLayout frame_layout;
     uint32_t width, height;
     Format   format;
     uint32_t usage;
@@ -198,16 +205,33 @@ typedef struct BarrierBuf {
 typedef struct BarrierImg {
     uint32_t slot;             /* 1-based Target index                      */
     VkImageLayout old_layout, new_layout;
+    /* The planner chose UNDEFINED because the pass overwrites the whole image
+     * (ATT_WRITE / ATT_DEPTH_WRITE) or because the resource is frame-local.
+     * Only those barriers may discard; every other one takes its oldLayout
+     * from where the image actually is, at RECORD time. A program is planned
+     * once and submitted every frame, so a baked-in oldLayout is a guess. */
+    bool discard;
     VkAccessFlags src_access, dst_access;
     VkPipelineStageFlags src_stage, dst_stage;
     uint32_t base_mip, mip_count, base_layer, layer_count;
 } BarrierImg;
 
+/* Sized by the most DISTINCT slots one pass can name, which is not the same as
+ * the number of uses: a pass declares up to MAX_COLOR_ATTACHMENTS colour
+ * attachments, one depth attachment, MAX_BINDS_PER_PASS sampled reads and
+ * MAX_BINDS_PER_PASS storage writes, and every one of those may name a
+ * different target. The table used to end at
+ * MAX_COLOR_ATTACHMENTS + 1 + MAX_BINDS_PER_PASS, which is 25 entries for 41
+ * possible slots; past 24 distinct images the remaining barriers were dropped
+ * silently inside add_img_barrier(). */
+#define MAX_IMAGES_PER_PASS (MAX_COLOR_ATTACHMENTS + 1u + \
+                             MAX_BINDS_PER_PASS + MAX_BINDS_PER_PASS)
+
 typedef struct BarrierPlan {
     uint32_t buf_count;
     uint32_t img_count;
     BarrierBuf bufs[MAX_BINDS_PER_PASS * 2u];
-    BarrierImg imgs[MAX_COLOR_ATTACHMENTS + 1u + MAX_BINDS_PER_PASS];
+    BarrierImg imgs[MAX_IMAGES_PER_PASS];
 } BarrierPlan;
 
 typedef struct PassPlan {
@@ -357,8 +381,29 @@ struct Gpu {
 /* Defined in §7 (frame lifecycle); used by gpu_destroy() in §2. Placed here
  * because it needs Gpu and DeleteItem to be complete types. */
 static void delete_apply(Gpu *g, DeleteItem *d);
+void gpu_destroy(Gpu *g);   /* gpu_create() unwinds through it on failure */
 static void release_texture_bindless_index(Gpu *g, uint32_t index);
 static void release_sampler_bindless_index(Gpu *g, uint32_t index);
+
+/* Record that a command buffer this program will submit touches
+ * [offset, offset+size) of `slot`. Every BufSlice a pass DECLARES goes through
+ * here, which is what makes the rule at write time possible. */
+static void commit_range(Gpu *g, uint32_t slot, uint64_t offset, uint64_t size) {
+    BufferSlot *bs;
+    uint64_t end;
+    if (slot == 0u || slot >= SLOT_BUFFERS) return;
+    bs = &g->buffers[slot];
+    end = offset + size;
+    if (end > bs->committed) bs->committed = end;
+}
+
+/* VUID-vkQueueSubmit-pCommandBuffers-00070: a device buffer that a command
+ * buffer touches may only be destroyed after that command buffer completes.
+ * Resources here are already retired by timeline value, so the only question
+ * is whether a frame ever touched the buffer at all. A buffer created and
+ * destroyed without one command buffer is free immediately; one that a frame
+ * used waits for the timeline. */
+static bool buffer_touched(const BufferSlot *bs) { return bs->committed != 0u; }
 
 /* ---- error + handle helpers ----------------------------------------------*/
 static void fail(Gpu *g, const char *fmt, ...) {
@@ -502,6 +547,13 @@ static VkPipelineStageFlags to_vk_stage_for_kind(PassKind k) {
            : VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT |
              VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
 }
+/* SH_ALL is a mask of the bits above it, so it is not a separate case: the
+ * old `if (s & SH_ALL) v |= ALL_GRAPHICS` matched for EVERY non-zero mask,
+ * which turned every narrow read_stages into an all-commands dependency on
+ * the source side — the widest possible barrier, from the one API that
+ * exists to keep barriers narrow. ACC_TRANSFER had the same shape problem:
+ * declaring a copy source added the write access bit too, so the src-side
+ * barrier named a writer that was not there. */
 static VkPipelineStageFlags to_vk_stage_bits(ShaderBits s) {
     VkPipelineStageFlags v = 0;
     if (s & SH_VERT) v |= VK_PIPELINE_STAGE_VERTEX_SHADER_BIT;
@@ -509,10 +561,16 @@ static VkPipelineStageFlags to_vk_stage_bits(ShaderBits s) {
     if (s & SH_COMP) v |= VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
     if (s & SH_TASK) v |= VK_PIPELINE_STAGE_TASK_SHADER_BIT_EXT;
     if (s & SH_MESH) v |= VK_PIPELINE_STAGE_MESH_SHADER_BIT_EXT;
-    if (s & SH_ALL)  v |= VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT;
     return v;
 }
-static VkAccessFlags to_vk_access_bits(Access2 a) {
+/* The consumer, not the caller, decides the stage for these: the command
+ * processor reads indirect arguments. It is added to the src side as well, so
+ * the pass that WRITES the arguments and the pass that indirectly draws are
+ * ordered against each other instead of only against shader stages. */
+static VkPipelineStageFlags to_vk_stage_extra(Access2 a) {
+    return (a & ACC_INDIRECT) ? VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT : 0u;
+}
+static VkAccessFlags to_vk_access_bits(Access2 a, bool is_dst) {
     VkAccessFlags v = 0;
     if (a & ACC_READ)     v |= VK_ACCESS_SHADER_READ_BIT;
     if (a & ACC_WRITE)    v |= VK_ACCESS_SHADER_WRITE_BIT;
@@ -521,7 +579,8 @@ static VkAccessFlags to_vk_access_bits(Access2 a) {
     if (a & ACC_VERTEX)   v |= VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT;
     if (a & ACC_INDEX)    v |= VK_ACCESS_INDEX_READ_BIT;
     if (a & ACC_UBO)      v |= VK_ACCESS_UNIFORM_READ_BIT;
-    if (a & ACC_TRANSFER) v |= VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+    if (a & ACC_TRANSFER)
+        v |= is_dst ? VK_ACCESS_TRANSFER_WRITE_BIT : VK_ACCESS_TRANSFER_READ_BIT;
     return v;
 }
 /* ============================================================================
@@ -1004,7 +1063,7 @@ Gpu *gpu_create(const GpuDesc *desc) {
         r = volkInitialize();
         if (r != VK_SUCCESS) {
             fail(g, "volkInitialize: %s", result_name(r));
-            free(g);
+            gpu_destroy(g);
             return NULL;
         }
         s_volk_initialized = true;
@@ -1071,17 +1130,23 @@ Gpu *gpu_create(const GpuDesc *desc) {
     ici.enabledLayerCount = n_layers;
     ici.ppEnabledLayerNames = layers;
     r = vkCreateInstance(&ici, NULL, &g->instance);
-    if (r != VK_SUCCESS) { fail(g, "vkCreateInstance: %s", result_name(r)); free(g); return NULL; }
+    if (r != VK_SUCCESS) { fail(g, "vkCreateInstance: %s", result_name(r)); gpu_destroy(g); return NULL; }
     volkLoadInstance(g->instance);
 
     r = vkEnumeratePhysicalDevices(g->instance, &dev_count, NULL);
     if (r != VK_SUCCESS || dev_count == 0) {
         fail(g, "no Vulkan physical device (%s)", result_name(r));
-        vkDestroyInstance(g->instance, NULL); free(g); return NULL;
+        gpu_destroy(g); return NULL;
     }
     {
         VkPhysicalDevice *all = (VkPhysicalDevice *)calloc(dev_count, sizeof *all);
-        vkEnumeratePhysicalDevices(g->instance, &dev_count, all);
+        if (!all) { fail(g, "out of host memory"); gpu_destroy(g); return NULL; }
+        r = vkEnumeratePhysicalDevices(g->instance, &dev_count, all);
+        if (r != VK_SUCCESS || dev_count == 0u) {
+            free(all);
+            fail(g, "vkEnumeratePhysicalDevices: %s", result_name(r));
+            gpu_destroy(g); return NULL;
+        }
         /* Prefer a discrete GPU, else take the first device. */
         pdev = all[0];
         for (i = 0; i < dev_count; ++i) {
@@ -1203,7 +1268,7 @@ Gpu *gpu_create(const GpuDesc *desc) {
     }
     if (g->queue_family == UINT32_MAX) {
         fail(g, "no graphics+compute queue family");
-        vkDestroyInstance(g->instance, NULL); free(g); return NULL;
+        gpu_destroy(g); return NULL;
     }
 
     memset(&dqci, 0, sizeof dqci);
@@ -1221,7 +1286,7 @@ Gpu *gpu_create(const GpuDesc *desc) {
     r = vkCreateDevice(pdev, &dci, NULL, &g->device);
     if (r != VK_SUCCESS) {
         fail(g, "vkCreateDevice: %s", result_name(r));
-        vkDestroyInstance(g->instance, NULL); free(g); return NULL;
+        gpu_destroy(g); return NULL;
     }
     volkLoadDevice(g->device);
     vkGetDeviceQueue(g->device, g->queue_family, 0u, &g->queue);
@@ -1264,7 +1329,17 @@ void gpu_destroy(Gpu *g) {
         wi.pValues = &g->timeline_value;
         vkWaitSemaphores(g->device, &wi, 10000000000ull);
     }
+    /* gpu_create() unwinds through here, so any handle may still be null:
+     * Vulkan takes VK_NULL_HANDLE for an object destroy and ignores it, but
+     * the volk entry points are only loaded once an instance/device exists. */
+    if (!g->instance) { free(g); return; }
     if (g->device) vkDeviceWaitIdle(g->device);
+    if (!g->device) {
+        if (g->surface) vkDestroySurfaceKHR(g->instance, g->surface, NULL);
+        vkDestroyInstance(g->instance, NULL);
+        free(g);
+        return;
+    }
     for (i = 0; i < g->frames_in_flight; ++i) {
         if (g->frames[i].queries) vkDestroyQueryPool(g->device, g->frames[i].queries, NULL);
         if (g->frames[i].present_done) vkDestroySemaphore(g->device, g->frames[i].present_done, NULL);
@@ -1439,9 +1514,9 @@ Buffer buffer_create(Gpu *g, const BufferDesc *desc) {
     uint64_t align;
     VkMemoryPropertyFlags mem_props;
 
+    if (!desc->size) { fail(g, "buffer_create: zero size"); return BUFFER_NIL; }
     idx = new_buffer_slot(g);
     if (!idx) { fail(g, "buffer_create: buffer table full"); return BUFFER_NIL; }
-    if (!desc->size) { fail(g, "buffer_create: zero size"); return BUFFER_NIL; }
     s = &g->buffers[idx];
     { uint32_t old_gen = s->gen; memset(s, 0, sizeof *s); s->gen = old_gen ? old_gen : 1u; }
     align = align_up(64u, g->props.limits.minStorageBufferOffsetAlignment);
@@ -1457,8 +1532,14 @@ Buffer buffer_create(Gpu *g, const BufferDesc *desc) {
     s->host_visible = (mem_props & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) != 0;
     if (!make_buffer(g, s->size, to_vk_buffer_usage(desc->usage), mem_props,
                      s->arena, &s->buffer, &s->memory,
-                     s->host_visible ? &s->mapped : NULL, &s->device_address))
+                     s->host_visible ? &s->mapped : NULL, &s->device_address)) {
+        /* Give the slot back: a failed create must leave nothing claimed, or
+         * the table fills up with tombstones over a session. */
+        ++s->gen;
+        memset(s, 0, sizeof *s);
+        s->gen = g->buffers[idx].gen;   /* keep the bumped generation */
         return BUFFER_NIL;
+    }
     s->live = true;
     return (Buffer){idx, s->gen};
 }
@@ -1620,6 +1701,7 @@ Target target_create(Gpu *g, const TargetDesc *desc) {
     s->format = desc->format; s->usage = desc->usage;
     s->samples = desc->samples ? desc->samples : SC_1;
     s->cls = desc->cls;
+    s->frame_layout = t->layout;
     copy_name(s->name, sizeof s->name, desc->name ? desc->name : "target");
     return (Target){si, s->gen};
 }
@@ -1655,8 +1737,11 @@ Sampler sampler_create(Gpu *g, const SamplerDesc *desc) {
     sci.borderColor = VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK;
     r = vkCreateSampler(g->device, &sci, NULL, &s->sampler);
     if (r != VK_SUCCESS) {
+        uint32_t gen = s->gen + 1u;
         fail(g, "vkCreateSampler: %s", result_name(r));
         release_sampler_bindless_index(g, bindless_index);
+        memset(s, 0, sizeof *s);
+        s->gen = gen;
         return SAMPLER_NIL;
     }
     s->live = true;
@@ -1687,14 +1772,34 @@ uint32_t sampler_bindless_index(const Gpu *g, Sampler s) {
 
 void buffer_destroy(Gpu *g, Buffer b) {
     BufferSlot *s = buffer_slot(g, b);
-    if (!s || s->arena != ARENA_DEVICE || b.index < 3u + STAGING_CHUNKS) return;
-    {
+    /* Three kinds of handle reach this: a buffer_create() buffer (the only one
+     * with a Vulkan buffer of its own), an arena_alloc() slice into the device
+     * or transient arena (owned by the arena), and a slice into a staging chunk
+     * (owned by the chunk). A slice has no independent lifetime to end, so this
+     * retires the SLICE: its declared range stops counting as touched, which
+     * is what lets the arena's owner be reclaimed without a false stall. The
+     * distinction is the handle generation, not the index alone. */
+    if (!s) return;
+    if (b.index < 3u + STAGING_CHUNKS) {
+        s->committed = 0u;
+        return;
+    }
+    if (s->arena != ARENA_DEVICE) {
+        fail(g, "buffer_destroy: handle %u is an arena slice, not a created buffer",
+             b.index);
+        return;
+    }
+    if (buffer_touched(s)) {
         DeleteItem d;
         memset(&d, 0, sizeof d);
         d.kind = DEL_BUFFER; d.a = (uint64_t)s->buffer; d.b = (uint64_t)s->memory;
         queue_delete(g, d);
+    } else {
+        vkDestroyBuffer(g->device, s->buffer, NULL);
+        vkFreeMemory(g->device, s->memory, NULL);
     }
     s->live = false; ++s->gen;
+    s->committed = 0u;
     memset(&s->buffer, 0, sizeof s->buffer);
     memset(&s->memory, 0, sizeof s->memory);
     s->mapped = NULL;
@@ -1780,23 +1885,23 @@ void gpu_tables(const Gpu *g, GpuTables *out) {
  * 4. ARENAS
  * ==========================================================================*/
 
-static uint32_t staging_chunk(Gpu *g) {
-    uint32_t i;
-    for (i = 0; i < STAGING_CHUNKS; ++i)
-        if (!g->staging[i].in_flight && g->staging[i].used == 0u) return i;
-    for (i = 0; i < STAGING_CHUNKS; ++i)
-        if (!g->staging[i].in_flight) { g->staging[i].used = 0u; return i; }
-    return UINT32_MAX;
-}
-
 BufSlice arena_alloc(Gpu *g, Arena arena, uint64_t size, uint64_t align) {
     ArenaState *a;
     uint64_t base, off;
     if (size == 0u) return BUF_SLICE_NIL;
     if (arena == ARENA_STAGING) {
-        uint32_t c = staging_chunk(g);
+        /* A chunk is reusable once the timeline has retired it. Prefer one
+         * that is already empty; otherwise take the first free one and reset
+         * it. Inlined from a one-call-site helper so the two passes read as
+         * the one decision they are. */
+        uint32_t c = UINT32_MAX;
         StagingChunk *chunk;
         uint64_t real_align = align < 16u ? 16u : align_up(align, 16u);
+        for (uint32_t i = 0; i < STAGING_CHUNKS; ++i)
+            if (!g->staging[i].in_flight && g->staging[i].used == 0u) { c = i; break; }
+        if (c == UINT32_MAX)
+            for (uint32_t i = 0; i < STAGING_CHUNKS; ++i)
+                if (!g->staging[i].in_flight) { c = i; g->staging[i].used = 0u; break; }
         if (c == UINT32_MAX) { fail(g, "arena_alloc: all staging chunks in flight"); return BUF_SLICE_NIL; }
         chunk = &g->staging[c];
         base = align_up(chunk->used, real_align);
@@ -2040,11 +2145,20 @@ static bool build_graphics(Gpu *g, PipeSlot *p) {
     memset(&msi, 0, sizeof msi);
     msi.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
     msi.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+    /* Depth state that the key fixes. depthWriteEnable is NOT a dynamic state,
+     * and a read-only depth attachment (ATT_DEPTH_READ) is illegal unless the
+     * pipeline was created with depthWriteEnable = VK_FALSE, so this has to
+     * come from the key rather than be overwritten per draw. */
     memset(&dsi, 0, sizeof dsi);
     dsi.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
-    dsi.depthTestEnable = VK_TRUE;
-    dsi.depthWriteEnable = VK_TRUE;
-    dsi.depthCompareOp = VK_COMPARE_OP_LESS;
+    dsi.depthTestEnable = p->key.depth != FMT_NONE && p->key.depth_cmp != CMP_NONE
+                        ? VK_TRUE : VK_FALSE;
+    dsi.depthWriteEnable = p->key.depth != FMT_NONE && p->key.depth_write
+                         ? VK_TRUE : VK_FALSE;
+    dsi.depthCompareOp = p->key.depth_cmp == CMP_NONE ? VK_COMPARE_OP_LESS
+                                                      : to_vk_compare(p->key.depth_cmp);
+    dsi.depthBoundsTestEnable = VK_FALSE;
+    dsi.stencilTestEnable = VK_FALSE;
 
     memset(cbas, 0, sizeof cbas);
     for (i = 0; i < p->color_count; ++i) {
@@ -2125,7 +2239,8 @@ static bool key_equal(const PipeKey *a, const PipeKey *b) {
     if (a->vs != b->vs || a->fs != b->fs || a->color_count != b->color_count ||
         a->depth != b->depth || a->view_mask != b->view_mask ||
         a->blend_fallback != b->blend_fallback ||
-        a->blend_static_off != b->blend_static_off) return false;
+        a->blend_static_off != b->blend_static_off ||
+        a->depth_cmp != b->depth_cmp || a->depth_write != b->depth_write) return false;
     if (strcmp(pipe_entry(a, false), pipe_entry(b, false)) ||
         strcmp(pipe_entry(a, true), pipe_entry(b, true))) return false;
     for (i = 0; i < a->color_count; ++i)
@@ -2140,8 +2255,10 @@ static uint32_t new_pipe_slot(Gpu *g) {
     return 0u;
 }
 
-static Pipe intern_key(Gpu *g, const PipeKey *key, bool compute,
-                       const char *vs_entry, const char *fs_entry) {
+/* `entry` is the compute entry point. Graphics entry points are part of the
+ * key (PipeKey.vs_entry / .fs_entry), so they cannot be passed separately
+ * without the two disagreeing. */
+static Pipe intern_key(Gpu *g, const PipeKey *key, bool compute, const char *entry) {
     PipeSlot *p;
     uint32_t i, idx;
     for (i = 1u; i < MAX_PIPES; ++i) {
@@ -2150,8 +2267,16 @@ static Pipe intern_key(Gpu *g, const PipeKey *key, bool compute,
             return (Pipe){i, g->pipes[i].gen};
     }
     if (g->frame_open) {
+        /* A pipeline is built by compiling SPIR-V and asking the driver for a
+         * PSO, which can cost milliseconds. Doing that between frame_begin()
+         * and frame_end() turns one slow frame into a visible hitch, so it is
+         * a programming error: intern every pipe before the first frame. */
         ++g->active_stats.pipeline_creations;
-        ++g->compiled_this_frame;   /* a compile inside a frame is a failure */
+        if (++g->compiled_this_frame > MAX_PIPES_IN_FRAME) {
+            fail(g, "pipe_intern: %u pipelines compiled inside one frame; "
+                    "intern pipes before frame_begin()", g->compiled_this_frame);
+            return PIPE_NIL;
+        }
     }
     idx = new_pipe_slot(g);
     if (!idx) {
@@ -2164,15 +2289,31 @@ static Pipe intern_key(Gpu *g, const PipeKey *key, bool compute,
     p->vs = key->vs; p->fs = key->fs;
     p->color_count = key->color_count;
     p->is_compute = compute;
-    copy_name(p->vs_entry, sizeof p->vs_entry, vs_entry ? vs_entry : "main");
-    copy_name(p->fs_entry, sizeof p->fs_entry, fs_entry ? fs_entry : "main");
+    /* The entry-point names belong to the KEY. build_graphics() reads
+     * p->vs_entry / p->fs_entry, so taking them from the intern_key()
+     * parameters instead made every pipe_intern() call build with whatever
+     * the caller happened to pass ("main") while key_equal() compared the
+     * names the caller actually asked for: two pipes that differ only in
+     * entry point collided in the table, and a custom entry point was never
+     * used. pipe_intern_compute() is the one caller that supplies an entry
+     * name that is not in the key. */
+    if (compute) {
+        copy_name(p->vs_entry, sizeof p->vs_entry, entry ? entry : "main");
+        copy_name(p->fs_entry, sizeof p->fs_entry, "main");
+    } else {
+        copy_name(p->vs_entry, sizeof p->vs_entry,
+                  key->vs_entry ? key->vs_entry : "main");
+        copy_name(p->fs_entry, sizeof p->fs_entry,
+                  key->fs_entry ? key->fs_entry : "main");
+    }
     {
+        /* Through locals: the destinations live inside `p`, which is inside
+         * `g`, and snprintf's %s argument may alias its own output. */
         char ve[64], fe[64];
         copy_name(ve, sizeof ve, p->vs_entry);
-        copy_name(fe, sizeof fe, p->fs_entry);
+        copy_name(fe, sizeof fe, key->fs ? p->fs_entry : "depth");
         snprintf(p->name, sizeof p->name, "%s_%.16s_%.16s%s",
-                 compute ? "cs" : "gfx", ve,
-                 key->fs ? fe : "depth",
+                 compute ? "cs" : "gfx", ve, fe,
                  key->blend_static_off ? "_opaque" : "");
     }
     if (compute ? !build_compute(g, p) : !build_graphics(g, p)) {
@@ -2187,7 +2328,7 @@ Pipe pipe_intern(Gpu *g, const PipeKey *key) {
     if (!key || key->color_count > MAX_COLOR_ATTACHMENTS) {
         fail(g, "pipe_intern: bad key"); return PIPE_NIL;
     }
-    return intern_key(g, key, false, key->vs_entry, key->fs_entry);
+    return intern_key(g, key, false, NULL);
 }
 Pipe pipe_find(const Gpu *g, const PipeKey *key) {
     uint32_t i;
@@ -2203,7 +2344,7 @@ Pipe pipe_intern_compute(Gpu *g, ShaderId cs, const char *entry) {
     memset(&k, 0, sizeof k);
     k.vs = cs;
     k.vs_entry = NULL;
-    return intern_key(g, &k, true, entry, "main");
+    return intern_key(g, &k, true, entry);
 }
 uint32_t pipe_count(const Gpu *g) {
     uint32_t i, n = 0;
@@ -2257,18 +2398,48 @@ static void add_buf_barrier(BarrierPlan *plan, const BarrierBuf *b) {
         e->src_stage |= b->src_stage;  e->dst_stage |= b->dst_stage;
         return;
     }
-    if (plan->buf_count < sizeof plan->bufs / sizeof plan->bufs[0])
-        plan->bufs[plan->buf_count++] = *b;
+    if (plan->buf_count == MU_ARRAY_COUNT(plan->bufs)) {
+        /* Dropping a buffer barrier is a silent data race between passes:
+         * assert rather than continue. */
+        MU_ASSERT(plan->buf_count < MU_ARRAY_COUNT(plan->bufs));
+        return;
+    }
+    plan->bufs[plan->buf_count++] = *b;
 }
+/* One entry per image per pass, because Vulkan needs one transition between
+ * distinct layouts and the entry can carry both ends of it. When the same
+ * image is named twice in a pass (a colour attachment that is also sampled),
+ * the SECOND use's layouts would silently replace the first and the pass would
+ * begin rendering into a layout nothing transitioned to. Merging keeps the
+ * first entry's old_layout and the last use's new_layout, which is the single
+ * transition the pass actually needs. */
 static void add_img_barrier(BarrierPlan *plan, const BarrierImg *b) {
     uint32_t i;
-    for (i = 0; i < plan->img_count; ++i)
-        if (plan->imgs[i].slot == b->slot) {
-            plan->imgs[i] = *b;   /* last desired layout for this pass wins */
-            return;
-        }
-    if (plan->img_count < sizeof plan->imgs / sizeof plan->imgs[0])
-        plan->imgs[plan->img_count++] = *b;
+    for (i = 0; i < plan->img_count; ++i) {
+        BarrierImg *e = &plan->imgs[i];
+        if (e->slot != b->slot) continue;
+        e->new_layout = b->new_layout;
+        e->src_access |= b->src_access; e->dst_access |= b->dst_access;
+        e->src_stage |= b->src_stage;   e->dst_stage |= b->dst_stage;
+        /* Discarding needs BOTH uses to be safe: an entry that keeps the
+         * previous contents cannot also declare them undefined. */
+        e->discard = e->discard && b->discard;
+        /* The transition covers the union of the subresources named. */
+        if (b->base_mip < e->base_mip) e->base_mip = b->base_mip;
+        if (b->base_mip + b->mip_count > e->base_mip + e->mip_count)
+            e->mip_count = b->base_mip + b->mip_count - e->base_mip;
+        if (b->base_layer < e->base_layer) e->base_layer = b->base_layer;
+        if (b->base_layer + b->layer_count > e->base_layer + e->layer_count)
+            e->layer_count = b->base_layer + b->layer_count - e->base_layer;
+        return;
+    }
+    if (plan->img_count == MU_ARRAY_COUNT(plan->imgs)) {
+        /* Dropping an image barrier leaves the next pass reading a layout the
+         * GPU never transitioned to. */
+        MU_ASSERT(plan->img_count < MU_ARRAY_COUNT(plan->imgs));
+        return;
+    }
+    plan->imgs[plan->img_count++] = *b;
 }
 
 static uint32_t target_index(Target t) {
@@ -2321,8 +2492,18 @@ static bool plan_barriers(Gpu *g, FrameProgram *prog) {
     uint32_t i, j;
 
     memset(bufs, 0, sizeof bufs);
+    /* A persistent image is NOT in UNDEFINED when the frame begins: the last
+     * frame left it in whatever layout its final transition produced, and
+     * apply_barriers()/pass_close() recorded that in TextureSlot.layout.
+     * Assuming UNDEFINED made every `oldLayout = UNDEFINED` transition both a
+     * validation error (oldLayout must match the real layout) and a logical
+     * discard: a --check path that renders a target in one program and then
+     * samples it from another lost the pixels. Transient and readback
+     * resources are the ones that really start undefined. */
     for (i = 0; i < MAX_TARGETS; ++i) {
-        imgs[i].layout = VK_IMAGE_LAYOUT_UNDEFINED;
+        TargetSlot *ts = &g->targets[i];
+        imgs[i].layout = (ts->tex && ts->live && ts->cls == RES_PERSISTENT)
+                       ? ts->tex->layout : VK_IMAGE_LAYOUT_UNDEFINED;
         imgs[i].pass = UINT32_MAX;
     }
     for (i = 0; i < prog->count; ++i) {
@@ -2350,16 +2531,22 @@ static bool plan_barriers(Gpu *g, FrameProgram *prog) {
             tr = &bufs[si];
             memset(&b, 0, sizeof b);
             b.slot = si; b.offset = u->slice.offset; b.size = u->slice.size;
-            b.dst_access = to_vk_access_bits(u->access);
-            b.dst_stage = u->stages ? to_vk_stage_bits(u->stages)
-                                    : (explicit_stages ? explicit_stages : dst_stage);
+            b.dst_access = to_vk_access_bits(u->access, true);
+            b.dst_stage = (u->stages ? to_vk_stage_bits(u->stages)
+                                     : (explicit_stages ? explicit_stages : dst_stage))
+                        | to_vk_stage_extra(u->access);
             if (tr->pass != UINT32_MAX && (tr->access & (VK_ACCESS_SHADER_WRITE_BIT |
                                                          VK_ACCESS_TRANSFER_WRITE_BIT))) {
                 b.src_access = tr->access;
                 b.src_stage = tr->stage;
                 add_buf_barrier(plan, &b);
             }
-            tr->access = b.dst_access; tr->stage = b.dst_stage; tr->pass = i;
+            /* A read leaves the range readable; it does not clear a pending
+             * write, so the next pass must still see the producer's stage. */
+            tr->access |= b.dst_access;
+            tr->stage |= b.dst_stage;
+            tr->pass = i;
+            commit_range(g, si, u->slice.offset, u->slice.size);
         }
         for (j = 0; j < d->buf_write_count; ++j) {
             const BufUse *u = &pp->buf_writes[j];
@@ -2378,14 +2565,19 @@ static bool plan_barriers(Gpu *g, FrameProgram *prog) {
             tr = &bufs[si];
             memset(&b, 0, sizeof b);
             b.slot = si; b.offset = u->slice.offset; b.size = u->slice.size;
-            b.dst_access = to_vk_access_bits(u->access);
-            b.dst_stage = u->stages ? to_vk_stage_bits(u->stages) : dst_stage;
+            b.dst_access = to_vk_access_bits(u->access, true);
+            /* A write to indirect arguments is consumed by the command
+             * processor: the barrier's src side has to name that stage or the
+             * next indirect draw has no ordering against the writer. */
+            b.dst_stage = (u->stages ? to_vk_stage_bits(u->stages) : dst_stage)
+                        | to_vk_stage_extra(u->access);
             if (tr->pass != UINT32_MAX && tr->pass != i) {
                 b.src_access = tr->access;
                 b.src_stage = tr->stage;
                 add_buf_barrier(plan, &b);
             }
             tr->access = b.dst_access; tr->stage = b.dst_stage; tr->pass = i;
+            commit_range(g, si, u->slice.offset, u->slice.size);
         }
         /* Attachments and sampled/storage targets: one image barrier per
          * target per pass, derived from intent, never from a caller layout. */
@@ -2411,6 +2603,7 @@ static bool plan_barriers(Gpu *g, FrameProgram *prog) {
                 b.old_layout = VK_IMAGE_LAYOUT_UNDEFINED;
                 b.src_access = 0u;
                 b.src_stage = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
+                b.discard = true;
             }
             if (b.old_layout != b.new_layout) add_img_barrier(plan, &b);
             imgs[ti].layout = want; imgs[ti].pass = i;
@@ -2435,6 +2628,7 @@ static bool plan_barriers(Gpu *g, FrameProgram *prog) {
                 b.old_layout = VK_IMAGE_LAYOUT_UNDEFINED;
                 b.src_access = 0u;
                 b.src_stage = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
+                b.discard = true;
             }
             if (b.old_layout != b.new_layout) add_img_barrier(plan, &b);
             imgs[ti].layout = want; imgs[ti].pass = i;
@@ -2599,6 +2793,14 @@ FrameProgram *frame_program_build(Gpu *g, const PassDesc *passes, uint32_t count
             fail(g, "pass '%s': too many declared bindings for one pass", d->name);
             goto fail;
         }
+        /* The barrier tables are sized by the most DISTINCT slots a pass can
+         * name, and the check above is what makes that bound reachable-but-not-
+         * exceedable. Stated as an assert so the reasoning is testable rather
+         * than implied by two constants that have to be kept in step. */
+        MU_ASSERT(d->color_count + (d->depth ? 1u : 0u) +
+                  d->tex_read_count + d->tex_write_count <= MAX_IMAGES_PER_PASS);
+        MU_ASSERT(d->buf_read_count + d->buf_write_count <=
+                  MU_ARRAY_COUNT(((BarrierPlan *)0)->bufs));
         for (j = 0; j < d->color_count; ++j) pp->colors[j] = src->colors[j];
         d->colors = pp->colors;
         if (d->depth) {
@@ -2630,11 +2832,30 @@ FrameProgram *frame_program_build(Gpu *g, const PassDesc *passes, uint32_t count
                 fail(g, "pass '%s': pipe has %u colour formats, pass has %u",
                      d->name, ps->key.color_count, d->color_count); goto fail;
             }
+            if (ps->is_compute && d->kind != PASS_COMPUTE) {
+                fail(g, "'%s': compute pipe in a %s pass", d->name,
+                     d->kind == PASS_GRAPHICS ? "graphics" : "unknown"); goto fail;
+            }
             if (!ps->is_compute) {
+                if (d->kind != PASS_GRAPHICS) {
+                    fail(g, "'%s': graphics pipe in a compute pass", d->name); goto fail;
+                }
                 for (j = 0; j < d->color_count; ++j) {
                     TargetSlot *ts = target_slot(g, pp->colors[j].target);
                     if (ts && ts->format != ps->key.color[j]) {
                         fail(g, "pass '%s': colour %u format mismatch", d->name, j);
+                        goto fail;
+                    }
+                }
+                /* The depth format is part of the pipeline, so a pass that
+                 * attaches a different depth format draws with a pipeline the
+                 * driver rejects. R8/R16 depth prepasses vs D32F shadow maps
+                 * is exactly where this shows up. */
+                {
+                    TargetSlot *zs = pp->has_depth ? target_slot(g, pp->depth_att.target) : NULL;
+                    Format want = zs ? zs->format : FMT_NONE;
+                    if (want != ps->key.depth) {
+                        fail(g, "pass '%s': depth format does not match the pipe", d->name);
                         goto fail;
                     }
                 }
@@ -2891,21 +3112,62 @@ bool frame_begin(Gpu *g) {
     g->arenas[ARENA_TRANSIENT].base_offset =
         (uint64_t)i * (ARENA_TRANSIENT_BYTES / g->frames_in_flight);
     g->arenas[ARENA_TRANSIENT].used = 0u;
+    /* This arena's high-water mark is per frame: it is reported as
+     * FrameStats.transient_peak_bytes, and "the most transient memory any
+     * frame ever used" is not a per-frame number. The device arena's peak is
+     * session-wide and is deliberately not reset here. */
+    g->arenas[ARENA_TRANSIENT].peak = 0u;
+    /* A frame-local target is re-derived this frame, so it starts UNDEFINED
+     * again; a persistent one keeps the layout the last frame left it in and
+     * apply_barriers() uses that as the transition's source. Doing this here,
+     * and not at plan time, is what makes one program correct for every
+     * frame instead of only for the frame it was built in. */
+    for (uint32_t t = 0; t < MAX_TARGETS; ++t)
+        if (g->targets[t].live && g->targets[t].cls == RES_FRAME)
+            g->targets[t].frame_layout = VK_IMAGE_LAYOUT_UNDEFINED;
 
     if (g->swapchain) {
+        uint32_t image_index = 0u;
         VkResult ar = vkAcquireNextImageKHR(g->device, g->swapchain, UINT64_MAX,
                                             f->acquire_done, VK_NULL_HANDLE,
-                                            &g->swapchain_index);
-        if (ar != VK_SUCCESS) { fail(g, "acquire swapchain image: %s", result_name(ar)); }
-        else {
-            /* Slot 0 stands for the acquired image: without the VkImage here
-             * the planned barriers for TARGET_SWAPCHAIN are skipped and the
-             * image is rendered to and presented in UNDEFINED layout. */
-            g->textures[0].image = g->swapchain_images[g->swapchain_index];
-            g->textures[0].view = g->swapchain_views[g->swapchain_index];
-            g->textures[0].storage_view = g->swapchain_views[g->swapchain_index];
-            g->textures[0].layout = VK_IMAGE_LAYOUT_UNDEFINED;
+                                            &image_index);
+        /* VK_SUBOPTIMAL_KHR is a usable image that is merely the wrong size
+         * for the surface: present it, and let the next resize fix it.
+         * Anything else (out of date, surface lost) means there is no image,
+         * so there is no frame: the caller skips it. Previously the error was
+         * only recorded and the frame continued with the PREVIOUS index, which
+         * renders into an image that is still owned by the presentation
+         * engine. */
+        if (ar != VK_SUCCESS && ar != VK_SUBOPTIMAL_KHR) {
+            fail(g, "acquire swapchain image: %s (recreate the swapchain with set_surface)",
+                 result_name(ar));
+            /* The command buffer is already recording: close it so the next
+             * frame_begin() can reset it without a validation complaint. */
+            vkEndCommandBuffer(f->cmd);
+            g->frame_open = false;
+            return false;
         }
+        if (ar == VK_SUBOPTIMAL_KHR)
+            snprintf(g->validation_note, sizeof g->validation_note,
+                     "swapchain is suboptimal; recreate it with set_surface");
+        /* The swapchain may hand back more images than frames_in_flight; the
+         * view arrays are sized for the framebuffer count, so clamp to what
+         * was actually created rather than index past the end. */
+        if (image_index >= g->swapchain_image_count) {
+            fail(g, "acquire returned image %u of %u", image_index,
+                 g->swapchain_image_count);
+            vkEndCommandBuffer(f->cmd);
+            g->frame_open = false;
+            return false;
+        }
+        g->swapchain_index = image_index;
+        /* Slot 0 stands for the acquired image: without the VkImage here
+         * the planned barriers for TARGET_SWAPCHAIN are skipped and the
+         * image is rendered to and presented in UNDEFINED layout. */
+        g->textures[0].image = g->swapchain_images[g->swapchain_index];
+        g->textures[0].view = g->swapchain_views[g->swapchain_index];
+        g->textures[0].storage_view = g->swapchain_views[g->swapchain_index];
+        g->textures[0].layout = VK_IMAGE_LAYOUT_UNDEFINED;
     }
 
     memset(&g->active_stats, 0, sizeof g->active_stats);
@@ -2915,6 +3177,34 @@ bool frame_begin(Gpu *g) {
     g->frame_open = true;
     g->cpu_start_ms = now_ms();
     return true;
+}
+
+/* The layout an image barrier starts from, decided when the frame is
+ * RECORDED rather than when the program was built. A plan is built once and
+ * replayed every frame: a persistent image is in whatever layout the previous
+ * frame left it in, so the build-time oldLayout is a guess. `b->discard` marks
+ * the one case where UNDEFINED is both correct and wanted (the pass overwrites
+ * the whole subresource). Frame-local images are re-derived each frame, so the
+ * build-time value is right for them too.
+ *
+ * Returns the old layout and, through the out parameters, the access and stage
+ * that go with it: a barrier whose srcAccessMask names a writer that is not
+ * there serialises more than the dependency needs. */
+static VkImageLayout barrier_src_layout(const TargetSlot *ts, const BarrierImg *b,
+                                        VkAccessFlags *src_access,
+                                        VkPipelineStageFlags *src_stage) {
+    VkImageLayout old;
+    if (b->discard || ts->cls == RES_FRAME) {
+        *src_access = b->src_access;
+        *src_stage = b->src_stage;
+        return b->old_layout;
+    }
+    old = ts->frame_layout;
+    *src_access = to_vk_layout_access(old, false);
+    *src_stage = old == VK_IMAGE_LAYOUT_UNDEFINED
+               ? VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT
+               : to_vk_layout_stage(old);
+    return old;
 }
 
 static void apply_barriers(Gpu *g, VkCommandBuffer cmd, PassPlan *pp) {
@@ -2942,11 +3232,15 @@ static void apply_barriers(Gpu *g, VkCommandBuffer cmd, PassPlan *pp) {
         BarrierImg *b = &plan->imgs[i];
         TargetSlot *ts = &g->targets[b->slot];
         VkImageMemoryBarrier *v = &ib[ni];
+        VkImageLayout old_layout;
+        VkAccessFlags src_access = b->src_access;
+        VkPipelineStageFlags img_src_stage = b->src_stage;
         if (!ts->tex || !ts->tex->image) continue;
+        old_layout = barrier_src_layout(ts, b, &src_access, &img_src_stage);
         memset(v, 0, sizeof *v);
         v->sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-        v->srcAccessMask = b->src_access; v->dstAccessMask = b->dst_access;
-        v->oldLayout = b->old_layout; v->newLayout = b->new_layout;
+        v->srcAccessMask = src_access; v->dstAccessMask = b->dst_access;
+        v->oldLayout = old_layout; v->newLayout = b->new_layout;
         v->image = ts->tex->image;
         v->subresourceRange.aspectMask = to_vk_aspect(ts->format);
         v->subresourceRange.baseMipLevel = b->base_mip;
@@ -2955,13 +3249,15 @@ static void apply_barriers(Gpu *g, VkCommandBuffer cmd, PassPlan *pp) {
         v->subresourceRange.layerCount = b->layer_count;
         v->srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
         v->dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-        src_stage |= b->src_stage; dst_stage |= b->dst_stage;
+        src_stage |= img_src_stage;   /* resolved at record time, not at build */
+        dst_stage |= b->dst_stage;
         /* Track the layout a whole-image transition leaves behind, so a later
          * readback_request() starts from where the image really is (a target
          * that was rendered and then sampled is in SHADER_READ_ONLY, not in
          * the attachment layout recorded after its rendering pass). */
         if (b->base_mip == 0u && b->mip_count >= ts->tex->mips)
             ts->tex->layout = b->new_layout;
+        ts->frame_layout = b->new_layout;
         ++ni;
     }
     if (nb == 0u && ni == 0u) return;
@@ -3262,11 +3558,39 @@ void frame_end(Gpu *g) {
 
 static VkCommandBuffer pass_cmd(PassCtx *p) { return p->cmd; }
 
+/* A draw is only legal once a pipeline is bound, and "a pipeline got bound"
+ * is exactly what PassCtx.pipe_bound records — it was being set in two places
+ * and read in none. The check is one load on a path that is already recorded
+ * command by command; it turns a validation-layer message at draw time into
+ * the reason, at the line. */
+static bool draw_ready(PassCtx *p, const char *what) {
+    if (!p->pipe_bound) {
+        fail(p->gpu, "%s: no pipeline bound in pass '%s' (PassDesc.pipe was "
+                     "PIPE_NIL and pass_bind_pipe() was never called)",
+             what, p->plan->desc.name);
+        return false;
+    }
+    return true;
+}
+
+
 void pass_push(PassCtx *p, const void *data, uint32_t size) {
     Gpu *g = p->gpu;
+    /* PUSH() makes the payload exactly PUSH_MAX bytes, so a caller passing
+     * sizeof(Push) is always legal and a caller passing something smaller
+     * gets a shader reading stale constants past `size`. Push the whole
+     * range from the caller's buffer, zero-filled to PUSH_MAX, so the bytes
+     * a shader reads are never a previous draw's. */
+    uint8_t buf[PUSH_MAX];
     if (!data || size == 0u || size > PUSH_MAX) {
         fail(g, "pass_push: size %u outside 1..%d", size, PUSH_MAX);
         return;
+    }
+    if (size < PUSH_MAX) {
+        memset(buf, 0, sizeof buf);
+        memcpy(buf, data, size);
+        data = buf;
+        size = PUSH_MAX;
     }
     /* stageFlags must name every stage of the layout's one push range
      * (VUID-vkCmdPushConstants-offset-01796), whatever kind the pass is. */
@@ -3335,21 +3659,20 @@ void pass_state(PassCtx *p, DrawState state) {
         VkColorBlendEquationEXT eqs[MAX_COLOR_ATTACHMENTS];
         VkColorComponentFlags masks[MAX_COLOR_ATTACHMENTS];
         uint32_t i, n = n_col ? n_col : 1u;
-        VkBlendFactor src = VK_BLEND_FACTOR_SRC_ALPHA;
-        VkBlendFactor dst = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+        /* write_mask is one 4-bit RGBA mask applied to every attachment, and
+         * its only two values are "all" and "none" (draw_state_depth_only).
+         * The old loop read a nibble per attachment, so it looked like a
+         * per-attachment partition that the struct does not have, and the
+         * "all" case only worked because 0xFFFF happens to fill every nibble. */
+        const VkColorComponentFlags rgba = state.write_mask
+            ? (VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
+               VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT)
+            : 0u;
         for (i = 0; i < n; ++i) {
             blends[i] = state.blend != BLEND_OPAQUE ? VK_TRUE : VK_FALSE;
             eqs[i] = to_vk_blend_equation((Blend)state.blend);
-            masks[i] = 0;
-            if (state.write_mask & (0xFu << (4u * i))) {
-                uint32_t m = (state.write_mask >> (4u * i)) & 0xFu;
-                masks[i] = (m & 1u ? VK_COLOR_COMPONENT_R_BIT : 0u) |
-                           (m & 2u ? VK_COLOR_COMPONENT_G_BIT : 0u) |
-                           (m & 4u ? VK_COLOR_COMPONENT_B_BIT : 0u) |
-                           (m & 8u ? VK_COLOR_COMPONENT_A_BIT : 0u);
-            }
+            masks[i] = rgba;
         }
-        (void)src; (void)dst;
         vkCmdSetRasterizationSamplesEXT(cmd, to_vk_samples((SampleCount)state.samples));
         vkCmdSetColorBlendEnableEXT(cmd, 0u, n, blends);
         vkCmdSetColorBlendEquationEXT(cmd, 0u, n, eqs);
@@ -3359,40 +3682,91 @@ void pass_state(PassCtx *p, DrawState state) {
      * every other DrawState axis is core-dynamic on Vulkan 1.3. */
 }
 
+/* The indirect verbs take a range the GPU reads itself, so nothing else in the
+ * API checks it: plan_barriers() only sees what a pass DECLARES, and a mistyped
+ * stride is a validation message at draw time at best. Both live here because
+ * both need the same three facts (the buffer, the range, the stride). */
+static bool indirect_range_ok(Gpu *g, const char *what, BufferSlot *b,
+                              BufSlice args, uint64_t stride, uint32_t max_draws) {
+    uint64_t need;
+    if ((uint64_t)args.offset % 4u != 0u) {
+        fail(g, "%s: args offset %llu is not a multiple of 4", what,
+             (unsigned long long)args.offset);
+        return false;
+    }
+    if (stride % 4u != 0u) {
+        fail(g, "%s: stride %llu is not a multiple of 4", what,
+             (unsigned long long)stride);
+        return false;
+    }
+    need = stride * (uint64_t)max_draws;
+    if (args.offset > b->size || need > b->size - args.offset) {
+        fail(g, "%s: %u commands of %llu bytes at offset %llu exceed the buffer (%llu bytes)",
+             what, max_draws, (unsigned long long)stride,
+             (unsigned long long)args.offset, (unsigned long long)b->size);
+        return false;
+    }
+    return true;
+}
+
 void pass_draw_indirect(PassCtx *p, BufSlice args, uint32_t max_draws) {
     BufferSlot *b = buffer_slot(p->gpu, args.buffer);
+    const uint64_t stride = sizeof(VkDrawIndirectCommand);
     if (!b) { fail(p->gpu, "pass_draw_indirect: bad args buffer"); return; }
-    vkCmdDrawIndirect(pass_cmd(p), b->buffer, args.offset,
-                      max_draws ? max_draws : 1u, sizeof(VkDrawIndirectCommand));
-    p->gpu->active_stats.draws += max_draws ? max_draws : 1u;
+    if (max_draws == 0u) return;   /* "no indirect draws this frame" */
+    if (!draw_ready(p, "pass_draw_indirect")) return;
+    if (!indirect_range_ok(p->gpu, "pass_draw_indirect", b, args, stride, max_draws))
+        return;
+    vkCmdDrawIndirect(pass_cmd(p), b->buffer, args.offset, max_draws,
+                      (uint32_t)stride);
+    /* max_draws is a ceiling: the GPU may execute fewer. Counting the ceiling
+     * keeps the statistic honest about work that was POSSIBLE this frame. */
+    p->gpu->active_stats.draws += max_draws;
 }
 void pass_draw_indirect_count(PassCtx *p, BufSlice args, BufSlice count,
                               uint32_t max_draws, uint32_t stride) {
     BufferSlot *b = buffer_slot(p->gpu, args.buffer);
     BufferSlot *c = buffer_slot(p->gpu, count.buffer);
+    const uint64_t real_stride = stride ? stride : sizeof(VkDrawIndirectCommand);
     if (!b || !c) { fail(p->gpu, "pass_draw_indirect_count: bad buffer"); return; }
+    if (max_draws == 0u) return;
+    if (!draw_ready(p, "pass_draw_indirect_count")) return;
+    if (!indirect_range_ok(p->gpu, "pass_draw_indirect_count", b, args,
+                           real_stride, max_draws))
+        return;
     vkCmdDrawIndirectCount(pass_cmd(p), b->buffer, args.offset,
-                              c->buffer, count.offset, max_draws,
-                              stride ? stride : (uint32_t)sizeof(VkDrawIndirectCommand));
+                           c->buffer, count.offset, max_draws,
+                           (uint32_t)real_stride);
     p->gpu->active_stats.draws += max_draws;
 }
 void pass_dispatch(PassCtx *p, uint32_t x, uint32_t y, uint32_t z) {
-    vkCmdDispatch(pass_cmd(p), x ? x : 1u, y ? y : 1u, z ? z : 1u);
+    /* The header says "any count 0 runs nothing, which is how a GPU-side
+     * decision costs no work". vkCmdDispatch(0,0,0) is legal and does exactly
+     * that; substituting 1 launched a workgroup for every caller that meant
+     * "nothing". */
+    if (x == 0u || y == 0u || z == 0u) return;
+    if (!draw_ready(p, "pass_dispatch")) return;
+    vkCmdDispatch(pass_cmd(p), x, y, z);
     ++p->gpu->active_stats.dispatches;
 }
 void pass_dispatch_indirect(PassCtx *p, BufSlice args) {
     BufferSlot *b = buffer_slot(p->gpu, args.buffer);
     if (!b) { fail(p->gpu, "pass_dispatch_indirect: bad args buffer"); return; }
+    if (!draw_ready(p, "pass_dispatch_indirect")) return;
     vkCmdDispatchIndirect(pass_cmd(p), b->buffer, args.offset);
     ++p->gpu->active_stats.dispatches;
 }
 void pass_draw(PassCtx *p, uint32_t verts, uint32_t instances,
                uint32_t first_vert, uint32_t first_instance) {
+    if (verts == 0u || instances == 0u) return;   /* "draw nothing" */
+    if (!draw_ready(p, "pass_draw")) return;
     vkCmdDraw(pass_cmd(p), verts, instances, first_vert, first_instance);
     ++p->gpu->active_stats.draws;   /* counted: fixed-count draws are the slow path */
 }
 
 void pass_draw_fullscreen_triangle(PassCtx *p, uint32_t width, uint32_t height) {
+    if (width == 0u || height == 0u) return;
+    if (!draw_ready(p, "pass_draw_fullscreen_triangle")) return;
     set_viewport_scissor(p->gpu, pass_cmd(p), width, height);
     vkCmdDraw(pass_cmd(p), 3u, 1u, 0u, 0u);
     ++p->gpu->active_stats.draws;
@@ -3509,7 +3883,10 @@ Upload *upload_begin(Gpu *g) {
     }
     if (chunk == UINT32_MAX) {
         /* The GPU still reads every chunk. Wait for the oldest upload rather
-         * than fail: a caller that ignores the failure draws with stale data. */
+         * than fail: a caller that ignores the failure draws with stale data.
+         * The cursor of the chunk we waited on MUST be reset after the wait:
+         * retire() clears `used` for it, but this upload then writes into it
+         * and the next upload_begin() must not treat a stale offset as live. */
         VkSemaphoreWaitInfo wi;
         uint64_t oldest = UINT64_MAX;
         for (i = 0; i < STAGING_CHUNKS; ++i)
@@ -3523,6 +3900,7 @@ Upload *upload_begin(Gpu *g) {
             fail(g, "upload_begin: all staging chunks in flight"); return NULL;
         }
         retire(g);
+        g->staging[chunk].used = 0u;
     }
     memset(&cai, 0, sizeof cai);
     cai.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
@@ -3569,6 +3947,15 @@ void upload_buffer(Upload *u, BufSlice dst, DataSpan src) {
     u->bytes += src.size;
 }
 
+/* The layout a texture rests in when no pass is using it. A sampled-only
+ * texture is SHADER_READ_ONLY; one that shaders also write (TGT_STORAGE) is
+ * GENERAL, because that is the layout every storage-image descriptor over it
+ * is written with (see write_image()). */
+static VkImageLayout idle_layout_for(const TextureSlot *t) {
+    return (t->usage & TEX_STORAGE) ? VK_IMAGE_LAYOUT_GENERAL
+                                    : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+}
+
 void upload_texture(Upload *u, Texture dst, const ImageRegion *r, DataSpan src) {
     Gpu *g = u->gpu;
     TextureSlot *t;
@@ -3582,14 +3969,46 @@ void upload_texture(Upload *u, Texture dst, const ImageRegion *r, DataSpan src) 
     if (!t) { fail(g, "upload_texture: bad texture handle"); return; }
     bpp = format_bytes(t->format);
     if (bpp == 0u) { fail(g, "upload_texture: unknown format"); return; }
+    /* The copy reads exactly this many bytes out of the upload span. A short
+     * span is a caller bug that would otherwise read past the end of the host
+     * buffer in vkCmdCopyBufferToImage. */
+    {
+        uint64_t depth = r->depth ? r->depth : 1u;
+        uint64_t need = (uint64_t)r->width * r->height * depth * bpp;
+        if (src.size < need) {
+            fail(g, "upload_texture: %llu-byte span for a %llu-byte region",
+                 (unsigned long long)src.size, (unsigned long long)need);
+            return;
+        }
+        if (r->width == 0u || r->height == 0u) {
+            fail(g, "upload_texture: empty region"); return;
+        }
+        if ((uint64_t)r->x + r->width > t->width ||
+            (uint64_t)r->y + r->height > t->height ||
+            (uint64_t)r->z + depth > t->depth ||
+            r->mip >= t->mips || r->layer >= t->layers) {
+            fail(g, "upload_texture: region outside the texture"); return;
+        }
+    }
     if (!staging_bump(g, u->chunk, src.size, 16u, &off, &host)) return;
     memcpy(host, src.data, (size_t)src.size);
 
     memset(&before, 0, sizeof before);
     before.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-    before.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    /* Start from where the image really is, not from UNDEFINED. UNDEFINED is
+     * the one layout that permits the GPU to discard the contents, so a second
+     * upload into a region of a texture whose mip 0 is already in
+     * SHADER_READ_ONLY (or a partial-region upload of a texture other regions
+     * of which are live) wiped the rest of the image on tilers. The first
+     * upload of a fresh image still comes from UNDEFINED, which is correct and
+     * cheap there. */
+    before.oldLayout = t->layout;
     before.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-    before.srcAccessMask = 0u;
+    before.srcAccessMask = before.oldLayout == VK_IMAGE_LAYOUT_UNDEFINED
+                         ? 0u
+                         : (VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT |
+                            VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
+                            VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
     before.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
     before.image = t->image;
     before.subresourceRange.aspectMask = to_vk_aspect(t->format);
@@ -3597,7 +4016,10 @@ void upload_texture(Upload *u, Texture dst, const ImageRegion *r, DataSpan src) 
     before.subresourceRange.levelCount = 1u;
     before.subresourceRange.baseArrayLayer = r->layer;
     before.subresourceRange.layerCount = 1u;
-    vkCmdPipelineBarrier(u->cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+    vkCmdPipelineBarrier(u->cmd,
+                         before.oldLayout == VK_IMAGE_LAYOUT_UNDEFINED
+                             ? VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT
+                             : VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
                          VK_PIPELINE_STAGE_TRANSFER_BIT, 0u,
                          0u, NULL, 0u, NULL, 1u, &before);
 
@@ -3618,16 +4040,23 @@ void upload_texture(Upload *u, Texture dst, const ImageRegion *r, DataSpan src) 
     vkCmdCopyBufferToImage(u->cmd, g->staging[u->chunk].buffer, t->image,
                            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1u, &copy);
 
+    /* Back to the layout the texture uses when nobody is uploading into it.
+     * A texture the shaders also write as a storage image lives in GENERAL, so
+     * forcing SHADER_READ_ONLY here left the descriptor written as GENERAL
+     * while the image sat in the wrong layout: a validation error and an
+     * undefined read. */
     after = before;
     after.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-    after.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    after.newLayout = idle_layout_for(t);
     after.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-    after.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    after.dstAccessMask = after.newLayout == VK_IMAGE_LAYOUT_GENERAL
+                        ? (VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT)
+                        : VK_ACCESS_SHADER_READ_BIT;
     vkCmdPipelineBarrier(u->cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
                          VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT |
                          VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0u,
                          0u, NULL, 0u, NULL, 1u, &after);
-    t->layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    t->layout = after.newLayout;
     u->bytes += src.size;
     u->has_staged = true;
 }
@@ -3640,7 +4069,7 @@ void upload_end(Gpu *g, Upload *u) {
     DeleteItem d;
     if (!u || u->gpu != g) { fail(g, "upload_end: invalid batch"); return; }
     r = vkEndCommandBuffer(u->cmd);
-    if (r != VK_SUCCESS) { fail(g, "upload_end: %s", result_name(r)); return; }
+    if (r != VK_SUCCESS) { fail(g, "upload_end: %s", result_name(r)); goto abandoned; }
     ++g->timeline_value;
     value = g->timeline_value;
     memset(&tsi, 0, sizeof tsi);
@@ -3655,7 +4084,11 @@ void upload_end(Gpu *g, Upload *u) {
     si.signalSemaphoreCount = 1u;
     si.pSignalSemaphores = &g->timeline;
     r = vkQueueSubmit(g->queue, 1u, &si, VK_NULL_HANDLE);
-    if (r != VK_SUCCESS) { fail(g, "upload submit: %s", result_name(r)); return; }
+    if (r != VK_SUCCESS) {
+        fail(g, "upload submit: %s", result_name(r));
+        --g->timeline_value;   /* the value was never signalled */
+        goto abandoned;
+    }
     g->staging[u->chunk].in_flight = true;
     g->staging[u->chunk].retire_value = value;
     memset(&d, 0, sizeof d);
@@ -3663,6 +4096,26 @@ void upload_end(Gpu *g, Upload *u) {
     d.a = (uint64_t)u->cmd;
     queue_delete(g, d);
     if (g->frame_open) g->active_stats.upload_bytes += u->bytes;
+    u->gpu = NULL;
+    u->cmd = VK_NULL_HANDLE;
+    u->cmd_begun = false;
+    retire(g);
+    return;
+
+abandoned:
+    /* The batch never reached the queue, so nothing will retire its command
+     * buffer or release its staging chunk. Do both here: a failed upload must
+     * not strand a chunk that every later upload_begin() then waits on. */
+    {
+        DeleteItem cb;
+        memset(&cb, 0, sizeof cb);
+        cb.kind = DEL_COMMAND_BUFFER;
+        cb.a = (uint64_t)u->cmd;
+        queue_delete(g, cb);
+    }
+    g->staging[u->chunk].used = 0u;
+    g->staging[u->chunk].in_flight = false;
+    g->staging[u->chunk].retire_value = 0u;
     u->gpu = NULL;
     u->cmd = VK_NULL_HANDLE;
     u->cmd_begun = false;
@@ -3743,7 +4196,7 @@ static void readback_submit(Gpu *g, Readback *rb, VkCommandBuffer cmd, void *dst
     rb->copied = false;
 }
 
-Readback *readback_request(Gpu *g, Texture src, DataSpan dst, uint32_t delay_frames) {
+Readback *readback_request(Gpu *g, Texture src, DataSpan dst) {
     TextureSlot *t = texture_slot(g, src);
     Readback *rb;
     VkCommandBuffer cmd;
@@ -3802,7 +4255,6 @@ Readback *readback_request(Gpu *g, Texture src, DataSpan dst, uint32_t delay_fra
     t->layout = restore;
 
     readback_submit(g, rb, cmd, (void *)dst.data, dst.size);
-    (void)delay_frames;  /* the timeline value already expresses the dependency */
     return rb;
 }
 
@@ -3938,14 +4390,18 @@ const char *gpu_last_error(const Gpu *g) {
 }
 
 bool gpu_validate(const Gpu *g) {
-    uint32_t i, live;
+    uint32_t i;
+    MU_STATIC_ASSERT(sizeof(DrawState) == 8u,
+                     "DrawState is the sort key; repacking it must not grow it");
+    MU_STATIC_ASSERT(PUSH_MAX % PUSH_ALIGN == 0u, "PUSH_MAX must be a multiple of PUSH_ALIGN");
     if (!g) return false;
-    if (sizeof(DrawState) != 8u) return false;
-    if (PUSH_MAX % PUSH_ALIGN != 0u) return false;
     if (!g->set || !g->pipe_layout || !g->timeline) return false;
-    live = 0u;
-    for (i = 1u; i < MAX_PIPES; ++i) if (g->pipes[i].live) ++live;
-    if (live > MAX_PIPES) return false;
+    /* Not a range check: every slot here is an array index, so a live count
+     * can never exceed the table it is counted in. The invariant worth
+     * checking is that no slot is live with a null pipeline, which is what a
+     * half-applied creation would leave behind. */
+    for (i = 1u; i < MAX_PIPES; ++i)
+        if (g->pipes[i].live && !g->pipes[i].pipeline) return false;
     for (i = 1u; i < SLOT_TEXTURES; ++i)
         if (g->textures[i].live && g->textures[i].bindless_index >= g->active_bindless)
             return false;
@@ -4056,10 +4512,32 @@ bool set_surface(Gpu *g, VkSurfaceKHR surface) {
     r = vkCreateSwapchainKHR(g->device, &sci, NULL, &g->swapchain);
     if (r != VK_SUCCESS) { fail(g, "swapchain: %s", result_name(r)); return false; }
     g->surface = surface;
-    vkGetSwapchainImagesKHR(g->device, g->swapchain, &image_count, NULL);
-    if (image_count > MAX_FRAMES_IN_FLIGHT) image_count = MAX_FRAMES_IN_FLIGHT;
+    /* The driver may hand back more images than there are frame slots, and
+     * the count it reports on the second call is not bounded by the first.
+     * swapchain_images[]/swapchain_views[] hold MAX_FRAMES_IN_FLIGHT entries,
+     * so clamp against the array and refuse a swapchain that does not fit
+     * rather than writing past the end of the table. */
+    image_count = 0u;
+    r = vkGetSwapchainImagesKHR(g->device, g->swapchain, &image_count, NULL);
+    if (r != VK_SUCCESS && r != VK_INCOMPLETE) {
+        fail(g, "swapchain image count: %s", result_name(r)); return false;
+    }
+    if (image_count == 0u || image_count > MAX_FRAMES_IN_FLIGHT) {
+        fail(g, "swapchain has %u images, this backend supports 1..%u",
+             image_count, (unsigned)MAX_FRAMES_IN_FLIGHT);
+        return false;
+    }
     images = (VkImage *)calloc(image_count, sizeof *images);
-    vkGetSwapchainImagesKHR(g->device, g->swapchain, &image_count, images);
+    if (!images) { fail(g, "out of memory"); return false; }
+    r = vkGetSwapchainImagesKHR(g->device, g->swapchain, &image_count, images);
+    if (r != VK_SUCCESS && r != VK_INCOMPLETE) {
+        free(images);
+        fail(g, "swapchain images: %s", result_name(r)); return false;
+    }
+    if (image_count > MAX_FRAMES_IN_FLIGHT) {
+        free(images);
+        fail(g, "swapchain image count changed between queries"); return false;
+    }
     g->swapchain_image_count = image_count;
     for (i = 0; i < image_count; ++i) {
         g->swapchain_images[i] = images[i];

@@ -20,6 +20,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <string.h> /* the inline helpers below copy names; do not rely on mu_macros */
 #include "../third_party/mu_lib/mu/mu_common.h"
 #include <vulkan/vulkan_core.h> /* Vk types for WSI integration and optional escape */
 
@@ -30,21 +31,42 @@
 /* ============================================================================
  * 1. CONFIG
  *    These capacities size internal tables; exhaustion is reported, not grown.
+ *    Every one is a compile-time budget rather than a growth policy: a table
+ *    that fills reports it through gpu_last_error() and the call returns a
+ *    nil handle.
+ *    MAX_PIPES is the count of LIVE interned pipelines; every program built
+ *    over a scene keeps its own, so the number has to cover the whole session.
  * ==========================================================================*/
 
 #define MAX_COLOR_ATTACHMENTS 8  /* MRT cap; each one is bytes/pixel written */
 #define MAX_BINDS_PER_PASS    16 /* sampled/storage bindings per pass, checked at build */
+/* Interned pipelines are permanent: the table never compacts, so this is the
+ * whole budget for a session. One PSO is on the order of 100 KB of driver
+ * memory, so 256 leaves room for a few hundred material variants and refuses
+ * the thousand-pipeline design loudly instead of silently. */
+#define MAX_PIPES             256
+/* Compiling more than this many pipelines while a frame is open is treated as
+ * a bug (see intern_key): a hitch, not a feature. */
+#define MAX_PIPES_IN_FRAME    4
 #define MAX_PASSES            64 /* a frame program is a fixed list */
 #define MAX_PROFILE_SCOPES    64 /* named timestamp scopes per frame */
 #define MAX_FRAMES_IN_FLIGHT  3  /* upper bound; GpuDesc selects the active count */
 #define PUSH_MAX              256 /* public push-constant payload limit */
-#define BINDLESS_TEXTURES     65536
+#define BINDLESS_TEXTURES     65536 /* the SHADER-side array size; the C side is
+                                     * min(this, device limits), see
+                                     * GpuTables.sampled_image_count */
 #define BINDLESS_SAMPLERS     256
 #define MAX_TARGETS           512
 #define MAX_MIPS              13
 #define ALIGN_DEVICE          1     /* raised to the device's queried buffer alignment */
 #define MAX_PIPE_NAME         48
 #define MAX_PASS_NAME         48
+
+/* The header's own width assumptions. A handle is the identity of a resource in
+ * every table; ALIGN_DEVICE and PUSH_ALIGN are used in pointer arithmetic. */
+MU_STATIC_ASSERT(MAX_FRAMES_IN_FLIGHT <= 8, "frame slots are indexed by small ints");
+MU_STATIC_ASSERT(MAX_PASSES <= 64, "pass indices pack into FrameStats");
+MU_STATIC_ASSERT(MAX_PIPES > MAX_PASSES, "a program with one pipe per pass must fit the pipe table");
 
 /* Push constants are bounded by Vulkan and padded to this alignment. */
 #define PUSH_ALIGN           16     /* payload structure alignment */
@@ -71,6 +93,15 @@ typedef struct Sampler { uint32_t index, gen; } Sampler;
 #define SAMPLER_NIL       HANDLE_NIL(Sampler)
 
 #define HANDLE_VALID(h) ((h).index != 0u)
+
+/* "index is not the nil sentinel" is only the cheap half of the test: a stale
+ * handle still has an index, and the swapchain pseudo-target has no
+ * generation at all. Code that decides on HANDLE_VALID() alone therefore
+ * accepts garbage. These two name the two real questions, so a call site says
+ * which one it means. */
+#define TARGET_IS_SWAPCHAIN(t) ((t).index == 0xFFFFFFFFu)
+#define HANDLE_MATCHES(h, gen_) (((h).index != 0u) && ((h).index != 0xFFFFFFFFu) && \
+                                 ((h).gen == (gen_)))
 
 /* The acquired swapchain image used as a pass attachment. Not a real pool
  * entry: the backend supplies the image view and the present transition. */
@@ -425,6 +456,16 @@ typedef struct PipeKey {
     Blend blend_fallback;
     /* Optional pipeline specialization for an always-opaque class. */
     bool blend_static_off;
+
+    /* Depth state. depthTestEnable / depthWriteEnable / depthCompareOp ARE
+     * dynamic in Vulkan 1.3, but four pipelines cannot differ only in them:
+     * VK_EXT_extended_dynamic_state3 does not cover depth write, and a
+     * read-only depth attachment (ATT_DEPTH_READ) requires depthWriteEnable =
+     * VK_FALSE at pipeline creation to be legal at all. Two pipelines that
+     * differ only in these fields are therefore distinct pipeline objects,
+     * and the key has to say so or the second one is silently reused. */
+    Compare   depth_cmp;               /* CMP_NONE = depth test off at creation */
+    bool      depth_write;
 } PipeKey;
 
 /* Interned. Same key -> same Pipe, no matter how many passes ask for it. */
@@ -448,23 +489,54 @@ static inline Pipe pipe_intern_graphics(Gpu *g, ShaderId vs, ShaderId fs,
 }
 
 /* Depth-only pipe (shadow maps, depth prepasses): no colour attachment. `fs`
- * may be SHADER_NONE, or a stage that only discards (alpha-tested casters). */
+ * may be SHADER_NONE, or a stage that only discards (alpha-tested casters).
+ * Depth-only is also the one class whose depth state must be static:
+ * depth_write_enable is not a dynamic state, so a face-culled shadow pass and
+ * a depth-equal prepass need different pipelines. */
 static inline Pipe pipe_intern_depth_only(Gpu *g, ShaderId vs, ShaderId fs, Format depth) {
     PipeKey key = {0};
     key.vs = vs;
     key.fs = fs;
     key.color_count = 0u;
     key.depth = depth;
+    key.depth_write = true;
+    key.depth_cmp = CMP_LESS;
     return pipe_intern(g, &key);
 }
 
-/* Fixed capacity of the interned-pipeline table. */
-#define MAX_PIPES 24
+/* Depth-only pipe with explicit static depth state (shadow pass variants). */
+static inline Pipe pipe_intern_depth_cmp(Gpu *g, ShaderId vs, ShaderId fs, Format depth,
+                                         Compare cmp, bool write) {
+    PipeKey key = {0};
+    key.vs = vs;
+    key.fs = fs;
+    key.color_count = 0u;
+    key.depth = depth;
+    key.depth_cmp = cmp;
+    key.depth_write = write;
+    return pipe_intern(g, &key);
+}
 
 /* ---- per-draw state ------------------------------------------------------
  * Small value object suitable for sorting draw batches and suppressing
  * redundant dynamic-state commands.
  * ----------------------------------------------------------------------- */
+/* What is fixed at pipeline creation and what is per-draw is not a matter of
+ * taste — it is the Vulkan dynamic-state list. These are the per-draw ones:
+ * viewport, scissor, cull mode, front face, topology, depth test enable,
+ * depth write enable, depth compare op, and (under EDS3) rasterization
+ * samples, colour blend enable/equation, colour write mask.
+ *
+ * What is NOT in DrawState, and why: vertex input and input assembly, because
+ * geometry is fetched by SV_VertexID; polygon mode, depth bias, logic op,
+ * line width and stencil state are not dynamic states in core 1.3, so they
+ * belong to the pipeline (PipeKey) and are not per-draw at all.
+ *
+ * `write_mask` is a "no colour written" encoding, not a partition across
+ * attachments: bit i of attachment 0's nibble is R, and the same 4 bits are
+ * applied to every attachment in the pass (Vulkan has one mask per attachment,
+ * this struct has one mask for the draw).
+ */
 typedef struct DrawState {
     uint8_t samples;      /* SampleCount: 1/2/4/8                           */
     uint8_t blend;        /* Blend: OPAQUE / ALPHA / PREMUL / ADD             */
@@ -472,29 +544,47 @@ typedef struct DrawState {
     uint8_t depth_write;  /* 0/1                                              */
     uint8_t cull;         /* Cull                                             */
     uint8_t topo;         /* Topo                                             */
-    uint16_t write_mask;  /* 4 bits per attachment, 8 attachments             */
+    uint16_t write_mask;  /* 0x0 = no colour written; anything else = all    */
 } DrawState;
 
-_Static_assert(sizeof(DrawState) == 8, "DrawState is the sort key; keep it 8 bytes");
+MU_STATIC_ASSERT(sizeof(DrawState) == 8, "DrawState is the sort key; keep it 8 bytes");
 
-/* The two states this engine actually needs, named for intent. */
+/* DRAW_MASK_ALL is "write every channel", and it is the value memset(0) *does
+ * not* produce. A DrawState that reached zero through design, rather than
+ * through draw_state_*(), writes no colour at all. */
+#define DRAW_MASK_ALL 0xFFFFu
+
+/* The states this engine actually needs, named for intent. */
 DrawState draw_state_opaque(uint8_t samples, uint8_t cull);
 DrawState draw_state_alpha(uint8_t samples, uint8_t cull);
 DrawState draw_state_depth_only(uint8_t samples);
 
 /* 64-bit sort key: pipe first, then state. Sorting the draw list on this is
- * what keeps dynamic state from costing a context roll per draw. */
+ * what keeps dynamic state from costing a context roll per draw.
+ *
+ * The state fields are packed by width, so every one of them is named:
+ * samples:3 blend:2 | depth_cmp:3 depth_write:1 | cull:2 topo:2 |
+ * write_mask:1 (only "any colour at all") | pipes:16. That is 30 bits, which
+ * leaves room for the pipe index in the low half where the state lives — the
+ * old packing shifted a 16-bit write_mask into a 24-bit state field and then
+ * put the pipe index at bit 40, so two thirds of the key was always zero.
+ *
+ * The key orders by pipe, then by state: that is the order that turns dynamic
+ * state changes into one run per pipeline instead of one per draw.
+ */
 static inline uint64_t draw_sort_key(uint32_t pipe_index, DrawState s) {
-    uint64_t st = 0;
-    st |= (uint64_t)s.samples;
-    st |= (uint64_t)s.blend      << 4;
-    st |= (uint64_t)s.depth_cmp  << 8;
-    st |= (uint64_t)s.depth_write<< 12;
-    st |= (uint64_t)s.cull       << 13;
-    st |= (uint64_t)s.topo       << 16;
-    st |= (uint64_t)s.write_mask << 20;
-    return ((uint64_t)pipe_index << 40) | st;
+    uint64_t k = 0;
+    k |= (uint64_t)(s.samples     & 0x7u) <<  0;
+    k |= (uint64_t)(s.blend       & 0x3u) <<  3;
+    k |= (uint64_t)(s.depth_cmp   & 0x7u) <<  5;
+    k |= (uint64_t)(s.depth_write & 0x1u) <<  8;
+    k |= (uint64_t)(s.cull        & 0x3u) <<  9;
+    k |= (uint64_t)(s.topo        & 0x3u) << 11;
+    k |= (uint64_t)(s.write_mask ? 1u : 0u) << 13;
+    k |= (uint64_t) pipe_index            << 16;
+    return k;
 }
+MU_STATIC_ASSERT(MAX_PIPES <= 0x10000, "draw_sort_key reserves 16 bits for the pipe index");
 
 /* ============================================================================
  * 9. FRAME
@@ -503,8 +593,11 @@ static inline uint64_t draw_sort_key(uint32_t pipe_index, DrawState s) {
  *    this API.
  * ==========================================================================*/
 
-/* Returns false when the swapchain is out of date or the window is minimised:
- * nothing is recorded and the caller simply does not run the frame. */
+/* Returns false when there is no frame to record: a frame is already open, the
+ * window is minimised, or image acquisition failed (a swapchain that went out
+ * of date). Nothing is recorded and the caller skips the frame. This does not
+ * recreate the swapchain — call set_surface() again with the same surface when
+ * gpu_last_error() names acquisition. */
 bool frame_begin(Gpu *g);
 
 /* A frame program is the resolved pass list for one configuration: barriers
@@ -650,7 +743,7 @@ void    upload_end(Gpu *g, Upload *u);   /* records, submits once, retires by ti
  *
  * Neither is for the frame path: each request allocates a staging buffer and
  * submits a command buffer. At most 32 requests can be in flight. */
-Readback *readback_request(Gpu *g, Texture src, DataSpan dst, uint32_t delay_frames);
+Readback *readback_request(Gpu *g, Texture src, DataSpan dst);
 Readback *readback_request_buffer(Gpu *g, BufSlice src, DataSpan dst);
 bool      readback_ready(Gpu *g, Readback *r, bool blocking);
 void      readback_release(Gpu *g, Readback *r);
@@ -690,7 +783,9 @@ typedef struct FrameStats {
     uint32_t  pipeline_creations, descriptor_writes;
     uint32_t  layout_transitions;
     uint32_t  escape_uses;
-    uint64_t  upload_bytes, transient_peak_bytes;
+    uint64_t  upload_bytes;
+    uint64_t  transient_peak_bytes;  /* highest transient high-water mark of
+                                      * THIS frame, not of the session */
     uint64_t  declared_bytes;       /* sum of per-pass logical estimates */
 } FrameStats;
 
@@ -746,15 +841,19 @@ enum {
  *
  *   PUSH(DrawPush, float mvp[16]; uint32_t texture_id; float tint[4];);
  */
-#define PUSH(name, BODY)                                                                    \
-    typedef struct ALIGNAS(PUSH_ALIGN) name##_body { BODY } name##_body;                 \
-    _Static_assert(sizeof(name##_body) <= PUSH_MAX,                                          \
-                   #name " exceeds the 256-byte push-constant limit");                           \
-    typedef struct ALIGNAS(PUSH_ALIGN) name {                                           \
-        BODY uint8_t _pad[PUSH_MAX - sizeof(name##_body)];                                    \
-    } name;                                                                                      \
-    _Static_assert(sizeof(name) == PUSH_MAX, #name " must be exactly 256 bytes");          \
-    _Static_assert(PUSH_MAX % PUSH_ALIGN == 0, "push size must be 16-byte aligned")
+/* The pad length is a compile-time constant, so it has to be able to be zero:
+ * a body that lands exactly on PUSH_MAX is legal, and `uint8_t _pad[0]` is
+ * not (GCC accepts it as an extension; -Werror + -pedantic does not). */
+#define PUSH_PAD_(used) ((used) >= PUSH_MAX ? 0u : (size_t)(PUSH_MAX - (used)))
+#define PUSH(name, BODY)                                                                     \
+    typedef struct ALIGNAS(PUSH_ALIGN) name##_body { BODY } name##_body;                     \
+    MU_STATIC_ASSERT(sizeof(name##_body) <= PUSH_MAX,                                          \
+                   #name " exceeds the 256-byte push-constant limit");                       \
+    typedef struct ALIGNAS(PUSH_ALIGN) name {                                                \
+        BODY uint8_t _pad[PUSH_PAD_(sizeof(name##_body))];                                   \
+    } name;                                                                                  \
+    MU_STATIC_ASSERT(sizeof(name) == PUSH_MAX, #name " must be exactly 256 bytes");            \
+    MU_STATIC_ASSERT(PUSH_MAX % PUSH_ALIGN == 0, "push size must be 16-byte aligned")
 
 /* ============================================================================
  * 15. INLINE HELPERS
@@ -844,12 +943,12 @@ static inline bool format_is_depth(Format f) {
 
 /* Compile-time honesty about the handles: 8 bytes, no padding, no surprises
  * when they are stored in app-side structs. */
-_Static_assert(sizeof(Buffer) == 8, "handle must stay 8 bytes");
-_Static_assert(sizeof(Texture) == 8, "handle must stay 8 bytes");
-_Static_assert(sizeof(Target) == 8, "handle must stay 8 bytes");
-_Static_assert(sizeof(Pipe) == 8, "handle must stay 8 bytes");
-_Static_assert(PUSH_MAX == 256, "push constant range is 256 bytes");
-_Static_assert(PUSH_ALIGN == 16, "push constants must be 16-byte aligned");
+MU_STATIC_ASSERT(sizeof(Buffer) == 8, "handle must stay 8 bytes");
+MU_STATIC_ASSERT(sizeof(Texture) == 8, "handle must stay 8 bytes");
+MU_STATIC_ASSERT(sizeof(Target) == 8, "handle must stay 8 bytes");
+MU_STATIC_ASSERT(sizeof(Pipe) == 8, "handle must stay 8 bytes");
+MU_STATIC_ASSERT(PUSH_MAX == 256, "push constant range is 256 bytes");
+MU_STATIC_ASSERT(PUSH_ALIGN == 16, "push constants must be 16-byte aligned");
 
 
 /* ============================================================================
@@ -934,22 +1033,33 @@ uint32_t sampler_bindless_index(const Gpu *g, Sampler s);
 /* Resolve a render target to the underlying texture when an operation accepts
  * a texture handle rather than a target handle (for example readback). */
 Texture target_texture(const Gpu *g, Target target);
-/// inline helpers 
 
+/* ============================================================================
+ * 18. PASS BUILDERS
+ *       compute_pass() fills a PassDesc for the one shape most compute demos
+ *       use. It was at the bottom of the file under "inline helpers", untyped
+ *       for its name argument and copying it with strcpy: a 60-character pass
+ *       name overran a 48-byte field silently. Names are truncated now, the
+ *       same way copy_name() in vk.c truncates every other name.
+ * ==========================================================================*/
 
+static inline void pass_name_set(char dst[MAX_PASS_NAME], const char *src) {
+    size_t i = 0u;
+    if (!src) src = "";
+    while (i + 1u < (size_t)MAX_PASS_NAME && src[i]) { dst[i] = src[i]; ++i; }
+    dst[i] = '\0';
+}
 
-MU_INLINE PassDesc *compute_pass(PassDesc *p, const char *name, Pipe pipe, BufUse *reads, uint32_t read_count,
-                              BufUse *writes, uint32_t write_count) {
+static inline PassDesc *compute_pass(PassDesc *p, const char *name, Pipe pipe,
+                                     const BufUse *reads, uint32_t read_count,
+                                     const BufUse *writes, uint32_t write_count) {
     memset(p, 0, sizeof *p);
-    strcpy(p->name, name);
+    pass_name_set(p->name, name);
     p->kind = PASS_COMPUTE;
     p->pipe = pipe;
-    p->buf_reads = reads; p->buf_read_count = read_count;
+    p->buf_reads = reads;   p->buf_read_count = read_count;
     p->buf_writes = writes; p->buf_write_count = write_count;
     return p;
 }
-
-
-
 
 #endif /* MU_VK_H */

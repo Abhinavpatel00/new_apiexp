@@ -93,7 +93,7 @@ static void app_frame(App *a) {
     demo_frame_end(d);
 }
 
-static void compute_pass(PassDesc *p, const char *name, Pipe pipe,
+static void compute_image_pass(PassDesc *p, const char *name, Pipe pipe,
                          Target *read, Target *write) {
     memset(p, 0, sizeof *p);
     strcpy(p->name, name);
@@ -109,9 +109,9 @@ static FrameProgram *build(App *a, uint32_t variant, bool init_only) {
     PassDesc passes[MAX_FLOODS + 6u];
     uint32_t count = 0u, i, floods = init_only ? 0u : flood_count(variant);
 
-    compute_pass(&passes[count++], "Init", a->init_pipe, NULL, &a->img[0]);
+    compute_image_pass(&passes[count++], "Init", a->init_pipe, NULL, &a->img[0]);
     for (i = 0u; i < floods; ++i)
-        compute_pass(&passes[count++], (i & 1u) ? "FloodB" : "FloodA", a->flood_pipe, &a->img[i & 1u],
+        compute_image_pass(&passes[count++], (i & 1u) ? "FloodB" : "FloodA", a->flood_pipe, &a->img[i & 1u],
                      &a->img[(i + 1u) & 1u]);
     if (init_only) return frame_program_build(d->gpu, passes, count);
     {

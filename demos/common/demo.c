@@ -141,7 +141,7 @@ static void wait_readback(Demo *d, Readback *rb, const char *what) {
 }
 
 void demo_readback(Demo *d, Target target, void *dst, size_t bytes) {
-    wait_readback(d, readback_request(d->gpu, target_texture(d->gpu, target), DATA_SPAN(dst, bytes), 0u), "target");
+    wait_readback(d, readback_request(d->gpu, target_texture(d->gpu, target), DATA_SPAN(dst, bytes)), "target");
 }
 
 void demo_readback_buffer(Demo *d, BufSlice src, void *dst, size_t bytes) {
